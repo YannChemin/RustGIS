@@ -242,9 +242,12 @@ fn wasm_host_requests_stop_at_the_time_limit() {
         }
     }
     let mut host = Slow(0);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    // The limit is far off for the first request, so no scheduling delay can end it early; the
+    // deadline then passes before the second.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut timed = crate::Timed { host: &mut host, deadline };
     assert!(timed.call("a", &json!({})).is_ok());
+    timed.deadline = std::time::Instant::now();
     let e = timed.call("b", &json!({})).unwrap_err();
     assert!(e.contains("too long"), "{e}");
     assert_eq!(host.0, 1, "the request after the limit never reached the host");

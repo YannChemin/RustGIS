@@ -34,6 +34,9 @@ pub struct State {
     /// A form's text and number fields being typed in, by widget and field, and the value they
     /// showed when typing began (so a value the plugin sets since wins).
     typing: HashMap<(String, String), Typing>,
+    /// A change sent this frame was refused: the frame's button clicks wait, since they would
+    /// act on the values the refused change tried to replace.
+    refused: bool,
 }
 
 struct Typing {
@@ -85,6 +88,7 @@ pub fn open(app: &mut RustGisApp, p: &Value) -> Result<Value, String> {
 
 fn run(app: &mut RustGisApp, id: &str, p: Value) {
     if let Err(e) = app.run_by_user(id, p) {
+        app.ui.plugin_panel.refused = true;
         app.session.notify(e, true);
     }
 }
@@ -131,6 +135,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     ui.separator();
     ui.add_space(4.0);
     let items: Vec<&PanelItemDecl> = decl.items.iter().filter(|d| state.items.get(d.key()).is_none_or(|s| s.visible)).collect();
+    app.ui.plugin_panel.refused = false;
     let mut i = 0;
     let mut clicks: Vec<String> = Vec::new();
     while let Some(item) = items.get(i).copied() {
@@ -158,9 +163,12 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         i += 1;
     }
     // A button runs after the widgets' changes of this frame are sent: a form field left by
-    // the click (the focus moves to the button) goes first, so the command sees it.
-    for id in clicks {
-        run(app, &id, Value::Null);
+    // the click (the focus moves to the button) goes first, so the command sees it. If one of
+    // those changes was refused, the click waits: its command would act on the old values.
+    if !app.ui.plugin_panel.refused {
+        for id in clicks {
+            run(app, &id, Value::Null);
+        }
     }
 }
 
@@ -313,8 +321,11 @@ fn form(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, stat
                         }
                         if r.lost_focus() {
                             // The draft ends with the focus; the value is sent only if it changed.
+                            // Escape ends the edit without a send: the draft is discarded.
                             app.ui.plugin_panel.typing.remove(&key);
+                            let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
                             if let Some(v) = typed_value(f, &text)
+                                && !escaped
                                 && state.form_value(id, &f.id) != Some(&v)
                             {
                                 changes.push((f.id.clone(), v));
