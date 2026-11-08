@@ -144,7 +144,7 @@ impl FormField {
             "text" => v.as_str().map(|s| Value::String(clip(s, MAX_STATE_TEXT))),
             "number" => number(v, self.integer),
             "checkbox" => v.as_bool().map(Value::Bool),
-            "select" => v.as_str().filter(|s| self.choices.iter().any(|c| c == s)).map(|s| json!(clip(s, MAX_STATE_LABEL))),
+            "select" => v.as_str().map(|s| clip(s, MAX_STATE_LABEL)).filter(|s| self.choices.contains(s)).map(Value::String),
             "multi" => {
                 let parts: Vec<&str> = match v {
                     Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
@@ -153,10 +153,11 @@ impl FormField {
                 };
                 let mut out: Vec<Value> = Vec::new();
                 for s in parts {
-                    if !self.choices.iter().any(|c| c == s) {
+                    // Matched as clipped, like the choices (see `form_fields`).
+                    let s = clip(s, MAX_STATE_LABEL);
+                    if !self.choices.contains(&s) {
                         continue;
                     }
-                    let s = clip(s, MAX_STATE_LABEL);
                     if !out.iter().any(|v| v.as_str() == Some(s.as_str())) {
                         out.push(Value::String(s));
                     }
@@ -181,6 +182,10 @@ impl FormField {
 
 /// A whole or fractional number from JSON, as this field takes it.
 fn number(v: &Value, integer: bool) -> Option<Value> {
+    // A whole number is checked as it came: converting it to a float first would round it.
+    if integer && let Some(i) = v.as_i64() {
+        return (i.unsigned_abs() <= 9_007_199_254_740_992).then(|| json!(i));
+    }
     let f = v.as_f64().filter(|x| x.is_finite())?;
     if integer { (f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0).then(|| json!(f as i64)) } else { Some(json!(f)) }
 }
@@ -749,5 +754,21 @@ mod tests {
         let long = "x".repeat(MAX_STATE_TEXT + 10);
         s.set_values(&d, &json!({"form": {"text": long}}));
         assert_eq!(s.form("form").unwrap()["text"].as_str().unwrap().chars().count(), MAX_STATE_TEXT);
+    }
+
+    #[test]
+    fn long_choices_match_as_clipped_and_whole_numbers_are_bounded_as_given() {
+        let long = "c".repeat(MAX_STATE_LABEL + 20);
+        let clipped = "c".repeat(MAX_STATE_LABEL);
+        let fields = form_fields(&[
+            json!({"id": "pick", "kind": "select", "choices": [long.clone()], "default": long.clone()}),
+            json!({"id": "many", "kind": "multi", "choices": [long.clone()]}),
+        ]);
+        assert_eq!(fields[0].default, Some(json!(clipped)), "a default longer than its choice still matches");
+        assert_eq!(fields[0].value_of(&json!(long)), Some(json!(clipped)));
+        assert_eq!(fields[1].value_of(&json!([long])), Some(json!([clipped])), "a selection longer than its choice is kept");
+        // A whole number is bounded as it came, not after a float has rounded it.
+        assert_eq!(number(&json!(9_007_199_254_740_993_i64), true), None);
+        assert_eq!(number(&json!(9_007_199_254_740_992_i64), true), Some(json!(9_007_199_254_740_992_i64)));
     }
 }

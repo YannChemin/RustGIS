@@ -396,10 +396,59 @@ fn call_with_timeout(
     timeout: Option<std::time::Duration>,
 ) -> Result<Value, String> {
     match &plugin.code {
-        Code::Wasm(module) => runtime::call(module, host, request, if tool { runtime::TOOL_FUEL } else { runtime::COMMAND_FUEL }),
+        Code::Wasm(module) => match timeout.filter(|_| !tool) {
+            Some(limit) => call_wasm_limited(module, host, request, limit),
+            None => runtime::call(module, host, request, if tool { runtime::TOOL_FUEL } else { runtime::COMMAND_FUEL }),
+        },
         #[cfg(not(target_arch = "wasm32"))]
         Code::Process(spec) => process::call(spec, host, request, (!tool).then_some(timeout.unwrap_or(process::COMMAND_TIMEOUT))),
         Code::None => Err(format!("{} has only skills, nothing to run", plugin.manifest.name)),
+    }
+}
+
+/// Calls a WebAssembly command that has a time limit. Once the limit has passed, host requests
+/// are refused, and a reply that arrives after it is an error. A host request already running
+/// runs to its end (the module's fuel bounds the rest).
+#[cfg(not(target_arch = "wasm32"))]
+fn call_wasm_limited(module: &wasmi::Module, host: &mut dyn Host, request: &Value, limit: std::time::Duration) -> Result<Value, String> {
+    let deadline = std::time::Instant::now() + limit;
+    let mut timed = Timed { host, deadline };
+    let out = runtime::call(module, &mut timed, request, runtime::COMMAND_FUEL)?;
+    if std::time::Instant::now() >= deadline {
+        return Err("it ran too long and was stopped".into());
+    }
+    Ok(out)
+}
+
+/// The browser has no clock for this: its commands run within their fuel alone.
+#[cfg(target_arch = "wasm32")]
+fn call_wasm_limited(module: &wasmi::Module, host: &mut dyn Host, request: &Value, _limit: std::time::Duration) -> Result<Value, String> {
+    runtime::call(module, host, request, runtime::COMMAND_FUEL)
+}
+
+/// The host as a WebAssembly command sees it under its time limit (see [`call_wasm_limited`]).
+#[cfg(not(target_arch = "wasm32"))]
+struct Timed<'a> {
+    host: &'a mut dyn Host,
+    deadline: std::time::Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Host for Timed<'_> {
+    fn call(&mut self, op: &str, params: &Value) -> Result<Value, String> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err("it ran too long and was stopped".into());
+        }
+        self.host.call(op, params)
+    }
+    fn log(&mut self, text: &str) {
+        self.host.log(text);
+    }
+    fn progress(&mut self, text: &str) {
+        self.host.progress(text);
+    }
+    fn cancelled(&self) -> bool {
+        self.host.cancelled()
     }
 }
 

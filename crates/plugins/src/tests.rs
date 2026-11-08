@@ -229,6 +229,27 @@ fn command_timeouts_are_bounded() {
     assert!(e.contains("timeout of 86401 seconds"), "{e}");
 }
 
+/// A WebAssembly command's host requests are refused once its time limit has passed.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn wasm_host_requests_stop_at_the_time_limit() {
+    struct Slow(u32);
+    impl Host for Slow {
+        fn call(&mut self, _: &str, _: &Value) -> Result<Value, String> {
+            self.0 += 1;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(json!(1))
+        }
+    }
+    let mut host = Slow(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    let mut timed = crate::Timed { host: &mut host, deadline };
+    assert!(timed.call("a", &json!({})).is_ok());
+    let e = timed.call("b", &json!({})).unwrap_err();
+    assert!(e.contains("too long"), "{e}");
+    assert_eq!(host.0, 1, "the request after the limit never reached the host");
+}
+
 /// Enabled plugin tools register with geoprocessing and return layers or selections.
 #[test]
 fn tools_join_the_geoprocessing_tools() {

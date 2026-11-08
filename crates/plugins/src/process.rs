@@ -285,6 +285,11 @@ fn converse(
             }
         };
         let bytes = match line {
+            // A line that comes after the deadline is not processed: a program that keeps
+            // printing gets no more host requests or success.
+            Line::Text(_) if deadline.is_some_and(|d| Instant::now() >= d) => {
+                return Err("it ran too long and was stopped".into());
+            }
             Line::Text(b) => b,
             Line::End => return Err("it exited without answering".into()),
             Line::TooLong => return Err(format!("it sent a line longer than {} MB", MAX_LINE / (1024 * 1024))),

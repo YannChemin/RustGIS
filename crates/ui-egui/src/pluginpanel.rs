@@ -113,6 +113,9 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     };
     let m = &plugin.manifest;
     let Some(decl) = m.panel.as_ref() else { return };
+    // A draft belongs to a form field the plugin still gives: one it removed takes its draft
+    // with it, so a field given back later starts from its stored value.
+    app.ui.plugin_panel.typing.retain(|(w, f), _| state.items.get(w.as_str()).is_some_and(|s| s.fields.iter().any(|x| x.id == *f)));
     let lang = app.lang().code();
     let tr = |s: &str| m.translate(lang, s).to_string();
     ui.horizontal(|ui| {
@@ -129,13 +132,14 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     ui.add_space(4.0);
     let items: Vec<&PanelItemDecl> = decl.items.iter().filter(|d| state.items.get(d.key()).is_none_or(|s| s.visible)).collect();
     let mut i = 0;
+    let mut clicks: Vec<String> = Vec::new();
     while let Some(item) = items.get(i).copied() {
         // Buttons side by side, wrapping, as many as follow each other.
         if item.kind == "button" {
             let n = items.iter().skip(i).take_while(|d| d.kind == "button").count();
             ui.horizontal_wrapped(|ui| {
                 for b in items.iter().skip(i).take(n) {
-                    button(app, ui, &pid, m, b, &state, &tr);
+                    clicks.extend(button(ui, &pid, m, b, &state, &tr));
                 }
             });
             ui.add_space(8.0);
@@ -152,6 +156,11 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
         ui.add_space(8.0);
         i += 1;
+    }
+    // A button runs after the widgets' changes of this frame are sent: a form field left by
+    // the click (the focus moves to the button) goes first, so the command sees it.
+    for id in clicks {
+        run(app, &id, Value::Null);
     }
 }
 
@@ -186,15 +195,9 @@ fn checkbox(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, 
     }
 }
 
-fn button(
-    app: &mut RustGisApp,
-    ui: &mut Ui,
-    pid: &str,
-    m: &Manifest,
-    item: &PanelItemDecl,
-    state: &PanelState,
-    tr: &dyn Fn(&str) -> String,
-) {
+/// A button's command when it was clicked. The caller runs it once the frame's other changes
+/// are sent (see [`show`]).
+fn button(ui: &mut Ui, pid: &str, m: &Manifest, item: &PanelItemDecl, state: &PanelState, tr: &dyn Fn(&str) -> String) -> Option<String> {
     let cmd = m.commands.iter().find(|c| c.id == item.command);
     let label = state
         .items
@@ -207,9 +210,7 @@ fn button(
     let help = if item.help.is_empty() { cmd.as_ref().map(|c| tr(&c.help)).unwrap_or_default() } else { tr(&item.help) };
     let resp = ui.add_enabled(enabled(item, state), egui::Button::new(label).min_size(vec2(64.0, 26.0)));
     let resp = if help.is_empty() { resp } else { resp.on_hover_text(help) };
-    if resp.clicked() {
-        run(app, &command_id(pid, &item.command), Value::Null);
-    }
+    resp.clicked().then(|| command_id(pid, &item.command))
 }
 
 /// A form: a label per field and its widget, the fields the plugin gave. A text or number
@@ -310,11 +311,14 @@ fn form(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, stat
                         if r.changed() {
                             app.ui.plugin_panel.typing.insert(key.clone(), Typing { text: text.clone(), was: stored.clone() });
                         }
-                        if r.lost_focus()
-                            && let Some(v) = typed_value(f, &text)
-                        {
+                        if r.lost_focus() {
+                            // The draft ends with the focus; the value is sent only if it changed.
                             app.ui.plugin_panel.typing.remove(&key);
-                            changes.push((f.id.clone(), v));
+                            if let Some(v) = typed_value(f, &text)
+                                && state.form_value(id, &f.id) != Some(&v)
+                            {
+                                changes.push((f.id.clone(), v));
+                            }
                         }
                     }
                 }
@@ -347,8 +351,13 @@ fn typed_value(f: &FormField, text: &str) -> Option<Value> {
     if f.kind != "number" {
         return Some(json!(text));
     }
+    // A whole number is read as it is typed, so one past the range the backend keeps (2^53) is
+    // refused rather than rounded to it.
+    if f.integer && let Ok(i) = text.trim().parse::<i64>() {
+        return (i.unsigned_abs() <= 9_007_199_254_740_992).then(|| json!(i));
+    }
     let n: f64 = text.trim().parse().ok().filter(|n: &f64| n.is_finite())?;
-    if f.integer && n.fract() != 0.0 {
+    if f.integer && (n.fract() != 0.0 || n.abs() > 9_007_199_254_740_992.0) {
         return None;
     }
     Some(if f.integer { json!(n as i64) } else { json!(n) })
