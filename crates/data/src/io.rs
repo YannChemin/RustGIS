@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde_json::{Map, Value as Json, json};
 
-use crate::raster::Crs;
+use crate::raster::{Crs, planetary};
 use crate::{Coord, DataError, Dataset, Field, FieldType, Geometry, GeometryType, ReadReport, Result, Value};
 
 /// Largest file read into memory (256 MiB). Parsing JSON can take several times the file size.
@@ -546,6 +546,8 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
             #[cfg(not(target_arch = "wasm32"))]
             {
                 crate::progress::begin(ds.features.len());
+                // Every feature is written: a layer of several kinds of geometry gets a GEOMETRY
+                // column, and one that declares no type takes its geometry's.
                 let table = crate::source::gpkg::write_table_in(ds, path, crs, gpkg)?;
                 Ok((0, Some(table)))
             }
@@ -797,7 +799,7 @@ pub fn read_geojson(text: &str, name: &str) -> Result<(Dataset, ReadReport)> {
     let mut features = Collector::default();
     match stream_features(text, &mut features) {
         Ok(rest) => match rest.get("type").and_then(Json::as_str) {
-            Some("FeatureCollection") => Ok(features.finish(name, &rest)),
+            Some("FeatureCollection") => features.finish(name, &rest),
             Some(_) => read_geojson_value(Json::Object(rest), name),
             None => Err(DataError::Format("GeoJSON: missing \"type\"".into())),
         },
@@ -827,9 +829,25 @@ fn clip(s: &str) -> String {
 /// Only named EPSG codes and CRS84 are honoured (not links, WKT or PROJ strings in the name, nor
 /// codes RustGIS doesn't know). The coordinates are x/y (easting/northing, longitude/latitude)
 /// whatever the axis order of the EPSG definition, as the legacy GeoJSON text says.
-pub(crate) fn declared_crs(root: &Map<String, Json>, messages: &mut Vec<String>) -> Option<(Crs, crate::raster::Transformer)> {
-    let decl = root.get("crs").filter(|v| !v.is_null())?;
-    match legacy_crs(decl) {
+///
+/// An IAU code (another body's system, as GDAL writes `urn:ogc:def:crs:IAU_2015::49900`) is read
+/// as longitude/latitude with a notice when it is planetocentric. Any other IAU code is an error,
+/// because its coordinates would land in the wrong place ([`planetary::declared`]).
+pub(crate) fn declared_crs(root: &Map<String, Json>, messages: &mut Vec<String>) -> Result<Option<(Crs, crate::raster::Transformer)>> {
+    let Some(decl) = root.get("crs").filter(|v| !v.is_null()) else { return Ok(None) };
+    if let Some(name) = decl.get("properties").and_then(|p| p.get("name")).and_then(Json::as_str).filter(|n| n.len() <= CRS_NAME_MAX)
+        && let Some((authority, code)) = iau_name(name)
+        && let Some(found) = planetary::declared(Some(&authority), Some(code), None)
+    {
+        return match found {
+            planetary::Declared::LonLat { note, .. } => {
+                messages.push(format!("GeoJSON crs \"{}\": {note}", clip(name)));
+                Ok(None)
+            }
+            planetary::Declared::Refused(e) => Err(DataError::Format(format!("GeoJSON crs \"{}\": {e}", clip(name)))),
+        };
+    }
+    Ok(match legacy_crs(decl) {
         Ok(found) => found,
         Err(why) => {
             let shown = match decl.get("properties").and_then(|p| p.get("name")).and_then(Json::as_str) {
@@ -842,7 +860,24 @@ pub(crate) fn declared_crs(root: &Map<String, Json>, messages: &mut Vec<String>)
             messages.push(format!("GeoJSON crs {shown}: {why}; coordinates are read as longitude/latitude"));
             None
         }
+    })
+}
+
+/// The authority and code of a `crs` name whose authority is the IAU's: `IAU_2015:49900`,
+/// `urn:ogc:def:crs:IAU_2015::49900`, `urn:ogc:def:crs:IAU:2015:49900` or
+/// `http(s)://www.opengis.net/def/crs/IAU/2015/49900` (any case, whitespace around).
+fn iau_name(name: &str) -> Option<(String, i64)> {
+    let up = name.trim().to_ascii_uppercase();
+    let rest = ["URN:OGC:DEF:CRS:", "HTTP://WWW.OPENGIS.NET/DEF/CRS/", "HTTPS://WWW.OPENGIS.NET/DEF/CRS/"]
+        .iter()
+        .find_map(|p| up.strip_prefix(p))
+        .unwrap_or(&up);
+    let authority = rest.split([':', '/']).next().filter(|a| planetary::is_iau(a))?;
+    let code = rest.rsplit([':', '/']).next()?;
+    if code.is_empty() || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
+    Some((authority.to_string(), code.parse().ok()?))
 }
 
 fn legacy_crs(decl: &Json) -> std::result::Result<Option<(Crs, crate::raster::Transformer)>, String> {
@@ -1020,6 +1055,11 @@ impl Schema {
         }
     }
 
+    /// A property's field, once seen.
+    pub(crate) fn index(&self, k: &str) -> Option<usize> {
+        self.index.get(k).copied()
+    }
+
     /// The fields, typed by every value seen.
     pub(crate) fn fields(&self) -> Vec<Field> {
         self.order.iter().map(|(k, ty)| Field::new(k.clone(), ty.unwrap_or(FieldType::Text))).collect()
@@ -1107,17 +1147,19 @@ impl Collector {
     }
 
     /// The dataset; `root` is the document's top level (for its `crs`, see [`declared_crs`]).
-    fn finish(self, name: &str, root: &Map<String, Json>) -> (Dataset, ReadReport) {
+    fn finish(self, name: &str, root: &Map<String, Json>) -> Result<(Dataset, ReadReport)> {
         let mut report = ReadReport { skipped: self.skipped, ..ReadReport::default() };
         let mut ds = Dataset::new(name, GeometryType::None, self.schema.fields());
         ds.features.reserve(self.features.len());
         if report.skipped > 0 {
             report.messages.push(format!("{} features had unreadable geometry", report.skipped));
         }
-        let declared = declared_crs(root, &mut report.messages);
+        let declared = declared_crs(root, &mut report.messages)?;
         let mut unconverted = 0usize;
         // Only features kept count toward the heights dropped.
         let mut zm = 0usize;
+        // Features kept, as longitude/latitude, with a latitude past the poles.
+        let mut swapped = 0usize;
         for (n, (geom, values, had_z)) in self.features.into_iter().enumerate() {
             // A feature that can't be converted is dropped, and its id is not reused, as when the
             // file is read in place.
@@ -1138,6 +1180,9 @@ impl Collector {
                 }
             }
             zm += usize::from(had_z);
+            // Converted geometry is already within ±90.5° (or dropped above), so only what is read
+            // as longitude/latitude can be swapped.
+            swapped += usize::from(declared.is_none() && geom.as_ref().is_some_and(latitude_past_poles));
             ds.features.push(crate::Feature { id: n as u64 + 1, geometry: geom, attrs });
         }
         ds.geometry_type = dominant_type(&ds);
@@ -1153,9 +1198,10 @@ impl Collector {
             // What couldn't be converted can't come back by defining the projection again.
             ds.crs_incomplete = unconverted > 0;
         }
+        report.messages.extend(swapped_latitude_note(swapped));
         // Last, as a source read in place notes it.
         ds.drop_zm(&mut report, zm);
-        (ds, report)
+        Ok((ds, report))
     }
 }
 
@@ -1177,7 +1223,7 @@ fn read_geojson_value(root: Json, name: &str) -> Result<(Dataset, ReadReport)> {
         Some(_) => features.add(&json!({"type": "Feature", "geometry": &root, "properties": {}})),
         None => return Err(DataError::Format("GeoJSON: missing \"type\"".into())),
     }
-    Ok(features.finish(name, &top))
+    features.finish(name, &top)
 }
 
 fn json_type(v: &Json) -> Option<FieldType> {
@@ -1199,7 +1245,9 @@ fn widen(a: FieldType, b: Option<FieldType>) -> FieldType {
     }
 }
 
-fn coerce(v: Value, ty: FieldType) -> Value {
+/// A value as its field's type holds it: an integer in a decimal field as a decimal, anything in
+/// a text field as its text.
+pub(crate) fn coerce(v: Value, ty: FieldType) -> Value {
     match (ty, v) {
         (_, Value::Null) => Value::Null,
         (FieldType::Double, Value::Int(i)) => Value::Float(i as f64),
@@ -1612,6 +1660,26 @@ pub(crate) fn read_rows(
     Ok((ds, report))
 }
 
+/// Whether a geometry has a position that could be longitude/latitude with the two swapped: its x
+/// within ±180.5° and its y past the poles (beyond ±90.5°, as the readers check). Eastings and
+/// northings, with x far past 180 too, aren't taken for that. Each position is judged on its own, so
+/// another position elsewhere doesn't hide it.
+pub(crate) fn latitude_past_poles(g: &Geometry) -> bool {
+    let mut past = false;
+    g.for_each_coord(|c| past |= c.x.abs() <= 180.5 && c.y.abs() > 90.5);
+    past
+}
+
+/// The notice for `n` features with a latitude past the poles (none for 0).
+pub(crate) fn swapped_latitude_note(n: usize) -> Option<String> {
+    let tail = "a latitude past ±90°: longitude and latitude may be swapped";
+    match n {
+        0 => None,
+        1 => Some(format!("1 feature has {tail}")),
+        n => Some(format!("{n} features have {tail}")),
+    }
+}
+
 /// Whether a geometry has coordinates outside longitude/latitude's range.
 fn out_of_lonlat(g: &Geometry) -> bool {
     let e = g.extent();
@@ -1982,7 +2050,8 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
     let mut skipped: Vec<String> = Vec::new();
     for n in shps {
         if out.len() >= MAX_ZIP_LAYERS {
-            break;
+            skipped.push(format!("{n} (past the {MAX_ZIP_LAYERS}-layer limit)"));
+            continue;
         }
         let base = stem(&n);
         let name = Path::new(&n).file_stem().and_then(|s| s.to_str()).unwrap_or("layer").to_string();
@@ -2006,6 +2075,7 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
     let mut mifs: Vec<String> = entries.iter().flatten().filter(|(n, _)| ext_of(n) == "mif").map(|(n, _)| n.clone()).collect();
     mifs.sort();
     for n in mifs {
+        // The `.mif` files not taken stay in `entries`, so the loop below names them as past the limit.
         if out.len() >= MAX_ZIP_LAYERS {
             break;
         }
@@ -2049,6 +2119,16 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
             Err(e) => skipped.push(format!("{n} ({e})")),
         }
     }
+    // At most this many skipped members are named; the rest are counted.
+    const NAMED_SKIPPED: usize = 20;
+    let skipped = if skipped.len() > NAMED_SKIPPED {
+        let more = skipped.len() - NAMED_SKIPPED;
+        let mut named: Vec<String> = skipped.into_iter().take(NAMED_SKIPPED).collect();
+        named.push(format!("and {more} more"));
+        named
+    } else {
+        skipped
+    };
     if out.is_empty() {
         let why = if skipped.is_empty() { String::new() } else { format!(": {}", skipped.join("; ")) };
         return Err(DataError::Format(format!("{file_name}: no Shapefile or other vector data in the archive could be read{why}")));
@@ -2115,7 +2195,7 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
             ds.crs = Some(c);
             Some(c.transformer().map_err(DataError::Format)?)
         }
-        None => shapefile_crs(parts.prj.as_deref(), &mut report).map(|(crs, t)| {
+        None => shapefile_crs(parts.prj.as_deref(), &mut report)?.map(|(crs, t)| {
             ds.crs = Some(crs);
             t
         }),
@@ -2217,9 +2297,11 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
 
 /// Converts a Shapefile's coordinates to longitude/latitude, from the coordinate system in its
 /// `.prj`: `None` for longitude/latitude, or when there's no `.prj` or it isn't understood (said in
-/// the report).
-fn shapefile_crs(prj: Option<&str>, report: &mut ReadReport) -> Option<(Crs, crate::raster::Transformer)> {
-    let crs = match crate::raster::wkt::read_wkt(prj?) {
+/// the report). Another body's system that can't be read is an error, because its coordinates
+/// would land in the wrong place as longitude/latitude.
+fn shapefile_crs(prj: Option<&str>, report: &mut ReadReport) -> Result<Option<(Crs, crate::raster::Transformer)>> {
+    let Some(prj) = prj else { return Ok(None) };
+    let crs = match crate::raster::wkt::read_wkt(prj) {
         Ok((c, note)) => {
             if let Some(n) = note {
                 report.messages.push(format!("the .prj file: {n}"));
@@ -2227,18 +2309,21 @@ fn shapefile_crs(prj: Option<&str>, report: &mut ReadReport) -> Option<(Crs, cra
             c
         }
         Err(e) => {
+            if let Some(refused) = planetary::refused_wkt(prj, &e) {
+                return Err(DataError::Format(format!("the .prj file: {refused}")));
+            }
             report.messages.push(format!("the .prj file: {e}; coordinates are read as longitude/latitude"));
-            return None;
+            return Ok(None);
         }
     };
     if crs == crate::raster::Crs::LonLat {
-        return None;
+        return Ok(None);
     }
     match crs.transformer() {
-        Ok(t) => Some((crs, t)),
+        Ok(t) => Ok(Some((crs, t))),
         Err(e) => {
             report.messages.push(format!("the .prj file: {e}; coordinates are read as longitude/latitude"));
-            None
+            Ok(None)
         }
     }
 }
@@ -2308,13 +2393,13 @@ pub fn shapefile_names_note(fields: &[Field], target: &str) -> Option<String> {
 }
 
 /// Keeps a diagnostic on one line and prevents field names from reordering its text.
-fn dbf_notice_char(c: char) -> char {
+pub(crate) fn dbf_notice_char(c: char) -> char {
     let reorders = matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
     if c.is_control() || reorders || matches!(c, '\u{2028}' | '\u{2029}') { ' ' } else { c }
 }
 
 /// A bounded field name for a dBase notice, with controls and directional marks flattened.
-fn dbf_notice_name(name: &str) -> String {
+pub(crate) fn dbf_notice_name(name: &str) -> String {
     let mut out = String::new();
     for c in name.chars().map(dbf_notice_char) {
         if out.len() + c.len_utf8() > 40 {
@@ -2457,6 +2542,20 @@ fn dbf_boolean(value: &Value) -> Option<bool> {
         Value::Int(i) => Some(*i != 0),
         _ => None,
     }
+}
+
+/// The notice for the `left_out` features an export to `name` (a file of extension `ext`) left
+/// out, as [`write_path_in`] and [`write_bytes_in`] count them; `None` when none were. A
+/// Shapefile export (`.shp`, or zipped) writes only drawable geometry of the layer's one kind (it
+/// writes no null shapes, though the format has them); FlatGeobuf, KML and GPX exports write only
+/// features with geometry; the other formats leave nothing out.
+pub fn left_out_note(name: &str, ext: &str, left_out: usize) -> Option<String> {
+    (left_out > 0).then(|| match ext {
+        "shp" | "zip" => format!(
+            "{name}: {left_out} features left out of the Shapefile: without drawable geometry, or with geometry of another kind than the layer's"
+        ),
+        _ => format!("{name}: {left_out} features without drawable geometry were left out"),
+    })
 }
 
 /// Whether [`shapefile_parts_in`] writes a feature with geometry `g` to a layer of type `gt`: one
@@ -2624,6 +2723,102 @@ pub(crate) fn group_rings(rings: Vec<(Vec<Coord>, bool)>) -> Geometry {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A Shapefile export of a polygon layer holding a point and a feature without geometry writes
+    /// the polygon and counts both left out, the point for its kind; a layer of polygons loses none.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_shapefile_counts_geometry_of_another_kind_left_out() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let geojson = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","properties":{"name":"area"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}},
+            {"type":"Feature","properties":{"name":"spot"},"geometry":{"type":"Point","coordinates":[5,5]}},
+            {"type":"Feature","properties":{"name":"none"},"geometry":null}]}"#;
+        let (mixed, _) = read_geojson(geojson, "mixed")?;
+        let dir = tempfile::tempdir()?;
+        assert_eq!(write_path(&mixed, &dir.path().join("mixed.shp"))?, 2);
+        let (back, _) = read_path(&dir.path().join("mixed.shp"))?;
+        assert_eq!(back.features.len(), 1);
+        let mut areas = mixed.clone();
+        areas.features.truncate(1);
+        assert_eq!(write_path(&areas, &dir.path().join("areas.shp"))?, 0);
+        Ok(())
+    }
+
+    /// The left-out notice names what each format can't hold: a Shapefile, features without
+    /// drawable geometry or of another kind; the others, features without drawable geometry.
+    /// Nothing left out, no notice.
+    #[test]
+    fn left_out_notes_say_what_the_format_cant_hold() {
+        for ext in ["shp", "zip"] {
+            assert_eq!(
+                left_out_note("out", ext, 2).as_deref(),
+                Some(
+                    "out: 2 features left out of the Shapefile: without drawable geometry, or with geometry of another kind than the layer's"
+                )
+            );
+        }
+        for ext in ["fgb", "kml", "gpx"] {
+            assert_eq!(left_out_note("out", ext, 1).as_deref(), Some("out: 1 features without drawable geometry were left out"));
+        }
+        assert_eq!(left_out_note("out", "shp", 0), None);
+        assert_eq!(left_out_note("out", "gpkg", 0), None);
+    }
+
+    /// A GeoPackage export loses no geometry: a layer read from a GeoJSON of a polygon and a point
+    /// (declared a polygon layer, by its most common kind) gets a GEOMETRY column holding both, and
+    /// a feature without geometry stays, as a table holds it. A layer of one kind keeps its kind's
+    /// column, whether it declares its type or not.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_geopackage_of_a_mixed_layer_keeps_every_kind() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let geojson = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","properties":{"name":"area"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}},
+            {"type":"Feature","properties":{"name":"spot"},"geometry":{"type":"Point","coordinates":[5,5]}},
+            {"type":"Feature","properties":{"name":"none"},"geometry":null}]}"#;
+        let (mixed, _) = read_geojson(geojson, "mixed")?;
+        assert_eq!(mixed.geometry_type, GeometryType::Polygon);
+        let dir = tempfile::tempdir()?;
+        // The column's type, and the rows written with whether each has geometry, read with SQL.
+        let table = |path: &Path| -> std::result::Result<(String, Vec<(String, bool)>), Box<dyn std::error::Error>> {
+            let conn = rusqlite::Connection::open(path)?;
+            let kind: String = conn.query_row("SELECT geometry_type_name FROM gpkg_geometry_columns", [], |r| r.get(0))?;
+            let mut rows = conn.prepare(r#"SELECT "name", "geom" IS NOT NULL FROM "mixed" ORDER BY "fid""#)?;
+            let written = rows.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+            Ok((kind, written))
+        };
+        let all = vec![("area".to_string(), true), ("spot".to_string(), true), ("none".to_string(), false)];
+        let path = dir.path().join("mixed.gpkg");
+        assert_eq!(write_path(&mixed, &path)?, 0);
+        assert_eq!(table(&path)?, ("GEOMETRY".to_string(), all.clone()));
+        // Read back, the point and the polygon are both there.
+        let (back, _) = read_path(&path)?;
+        let mut kinds: Vec<GeometryType> = back.features.iter().filter_map(|f| f.geometry.as_ref().map(Geometry::kind)).collect();
+        kinds.sort_by_key(|k| format!("{k:?}"));
+        assert_eq!(kinds, [GeometryType::Point, GeometryType::Polygon]);
+        // A layer that declares no geometry type does the same.
+        let mut typeless = mixed.clone();
+        typeless.geometry_type = GeometryType::None;
+        let at = dir.path().join("typeless.gpkg");
+        assert_eq!(write_path(&typeless, &at)?, 0);
+        assert_eq!(table(&at)?, ("GEOMETRY".to_string(), all));
+        // Projected, every feature is written too.
+        let utm = Crs::from_epsg(32631).ok_or("no UTM zone 31N")?;
+        let projected = dir.path().join("projected.gpkg");
+        assert_eq!(write_path_in(&mixed, &projected, utm)?, 0);
+        assert_eq!(table(&projected)?.0, "GEOMETRY");
+        // One kind, declared or not: that kind's column, nothing left out.
+        let mut areas = mixed.clone();
+        areas.features.retain(|f| !matches!(f.geometry, Some(Geometry::Point(_))));
+        let one = vec![("area".to_string(), true), ("none".to_string(), false)];
+        let at = dir.path().join("areas.gpkg");
+        assert_eq!(write_path(&areas, &at)?, 0);
+        assert_eq!(table(&at)?, ("MULTIPOLYGON".to_string(), one.clone()));
+        areas.geometry_type = GeometryType::None;
+        let at = dir.path().join("typeless-areas.gpkg");
+        assert_eq!(write_path(&areas, &at)?, 0);
+        assert_eq!(table(&at)?, ("MULTIPOLYGON".to_string(), one));
+        Ok(())
+    }
 
     /// Exercises caller cleanup through the public Shapefile writer, one fresh process per collision.
     #[cfg(not(target_arch = "wasm32"))]
@@ -3445,6 +3640,34 @@ mod tests {
         }
         // A .shp alone is refused with a hint to zip it.
         assert!(read_bytes("x.shp", &entries[0].1).is_err());
+        // Shapefiles past the layer limit are named, not dropped unsaid; at the limit nothing is said.
+        let shapefiles = |count: usize| -> Vec<(String, Vec<u8>)> {
+            (0..count).flat_map(|i| entries.iter().take(4).map(move |(n, b)| (format!("s{i:02}.{}", ext(n)), b.clone()))).collect()
+        };
+        fn ext(n: &str) -> String {
+            n.rsplit('.').next().unwrap_or_default().to_ascii_lowercase()
+        }
+        let layers = read_zip("x.zip", &crate::zip::write(&shapefiles(MAX_ZIP_LAYERS + 2)).unwrap()).unwrap();
+        assert_eq!(layers.len(), MAX_ZIP_LAYERS);
+        assert_eq!(layers[0].1.messages, ["x.zip: skipped s32.shp (past the 32-layer limit); s33.shp (past the 32-layer limit)"]);
+        let layers = read_zip("x.zip", &crate::zip::write(&shapefiles(MAX_ZIP_LAYERS)).unwrap()).unwrap();
+        assert_eq!(layers.len(), MAX_ZIP_LAYERS);
+        assert!(layers.iter().all(|(_, r)| r.messages.is_empty()), "{:?}", layers[0].1.messages);
+        // MapInfo files past the limit are named too (by the loop over the other members, which
+        // they're left to), once each.
+        let mif = b"Version 300\nColumns 1\n  id Integer\nData\nPoint 1 2\n".to_vec();
+        let mifs = |count: usize| -> Vec<(String, Vec<u8>)> {
+            (0..count).flat_map(|i| [(format!("m{i:02}.mif"), mif.clone()), (format!("m{i:02}.mid"), b"1\n".to_vec())]).collect()
+        };
+        let layers = read_zip("x.zip", &crate::zip::write(&mifs(MAX_ZIP_LAYERS + 1)).unwrap()).unwrap();
+        assert_eq!(layers.len(), MAX_ZIP_LAYERS);
+        assert_eq!(layers[0].1.messages, ["x.zip: skipped m32.mif (past the 32-layer limit)"]);
+        let layers = read_zip("x.zip", &crate::zip::write(&mifs(MAX_ZIP_LAYERS)).unwrap()).unwrap();
+        assert!(layers.iter().all(|(_, r)| r.messages.is_empty()), "{:?}", layers[0].1.messages);
+        // A long list of skipped members names the first ones and counts the rest.
+        let layers = read_zip("x.zip", &crate::zip::write(&mifs(MAX_ZIP_LAYERS + 25)).unwrap()).unwrap();
+        let note = &layers[0].1.messages[0];
+        assert!(note.contains("m51.mif") && !note.contains("m52.mif") && note.ends_with("; and 5 more"), "{note}");
     }
 
     /// A Shapefile's loose files picked or dropped together are zipped into one, which reads as a

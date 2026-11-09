@@ -998,7 +998,7 @@ fn crowding(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
                         .range(CALLOUT_REACH)
                         .speed(1.0)
                         .max_decimals(0)
-                        .prefix(tl!("at most "))
+                        .prefix(format!("{} ", tl!("at most")))
                         .suffix(" pt"),
                 )
                 .labelled_by(input_label.id)
@@ -1817,6 +1817,35 @@ mod tests {
         let app = h.state_mut();
         app.run("edit.undo", json!(null)).unwrap();
         assert_eq!(clause(app).as_deref(), Some("pop_max > 5000000"), "undo brings the clause back");
+    }
+
+    #[test]
+    fn retained_area_clauses_do_not_claim_clean_features_are_unlabelled() {
+        use rustgis_engine::data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value};
+        let mut app = with_cities();
+        let id = app.session.active_layer.unwrap();
+        let c = Coord::new;
+        let mut data = Dataset::new("Area labels", GeometryType::Polygon, vec![Field::new("n", FieldType::Double)]);
+        for (n, ring) in [
+            (1.0, vec![c(0.0, 0.0), c(1.0, 0.0), c(1.0, 1.0), c(0.0, 0.0)]),
+            (2.0, vec![c(-180.0, 90.0), c(180.0, 90.0), c(-90.0, -90.0), c(90.0, -80.0)]),
+        ] {
+            data.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![Value::Float(n)]);
+        }
+        let layer = app.session.map_mut().layer_mut(id).unwrap();
+        layer.dataset = data;
+        layer.labels.enabled = true;
+        layer.labels.default.field = "n".into();
+        layer.labels.default.where_ = Some("$area > 0".into());
+        layer.definition_query = Some("n = 1".into());
+        let mut h = harness(app);
+        h.run();
+        assert!(h.query_by_label_contains("This clause no longer reads").is_none());
+        assert_eq!(h.state().session.map().layer(id).unwrap().visible_rows(), [true, false]);
+        h.get_by_label("Check").click();
+        h.run();
+        assert!(h.query_by_label_contains("area is ambiguous").is_some());
+        assert_eq!(clause(h.state()).as_deref(), Some("$area > 0"));
     }
 
     /// A clause that doesn't read says why, and Apply leaves the layer as it was.

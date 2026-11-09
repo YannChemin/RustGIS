@@ -26,10 +26,16 @@ fn err(e: String) -> DataError {
 
 /// The rows of a small metadata table, as (column name → value) lookups.
 fn meta_rows(db: &Db<Shared>, tables: &[Table], name: &str) -> Result<Vec<Vec<(String, Val)>>> {
-    let t = tables
-        .iter()
-        .find(|t| t.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| DataError::Format(format!("not a GeoPackage: no {name} table")))?;
+    let Some(t) = tables.iter().find(|t| t.name.eq_ignore_ascii_case(name)) else {
+        // Attribute-only and tile-only packages can omit the geometry registration table.
+        if name.eq_ignore_ascii_case("gpkg_geometry_columns") {
+            if !tables.iter().any(|table| table.name.eq_ignore_ascii_case("gpkg_contents")) {
+                return Err(DataError::Format("not a GeoPackage: no gpkg_contents table".into()));
+            }
+            return Ok(Vec::new());
+        }
+        return Err(DataError::Format(format!("not a GeoPackage: no {name} table")));
+    };
     let mut out = Vec::new();
     let mut too_many = false;
     db.rows(t, |_, r| {
@@ -83,6 +89,58 @@ pub fn layers(bytes: Shared) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Unsupported contents omitted when an uploaded GeoPackage is added as feature layers, by type.
+pub fn unsupported_table_counts(bytes: Shared) -> Result<Vec<(String, u64)>> {
+    let db = Db::open(bytes).map_err(err)?;
+    let schema = db.tables().map_err(err)?;
+    let registered: std::collections::HashSet<String> = meta_rows(&db, &schema, "gpkg_geometry_columns")?
+        .iter()
+        .filter_map(|row| text(get(row, "table_name")))
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    let table = schema
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case("gpkg_contents"))
+        .ok_or_else(|| DataError::Format("not a GeoPackage: no gpkg_contents table".into()))?;
+    let kind_col = table
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case("data_type"))
+        .ok_or_else(|| DataError::Format("GeoPackage: gpkg_contents has no data_type column".into()))?;
+    let name_col = table
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case("table_name"))
+        .ok_or_else(|| DataError::Format("GeoPackage: gpkg_contents has no table_name column".into()))?;
+    if [kind_col, name_col].iter().any(|&index| table.columns.get(index).is_some_and(|column| column.generated)) {
+        return Err(DataError::Format("GeoPackage: uploaded catalogs with virtual generated table_name or data_type columns are not supported; materialize these columns or select a feature table explicitly".into()));
+    }
+    let mut counts = std::collections::BTreeMap::<String, u64>::new();
+    let mut invalid = 0u64;
+    // Count in place: the contents catalog can be large without materializing its rows.
+    db.rows(table, |_, row| {
+        let (Some(Val::Text(kind)), Some(Val::Text(name))) = (row.get(kind_col), row.get(name_col)) else {
+            invalid = invalid.saturating_add(1);
+            return ControlFlow::Continue(());
+        };
+        if !registered.contains(&name.to_ascii_lowercase()) {
+            let kind = ["attributes", "features", "tiles", "2d-gridded-coverage"]
+                .into_iter()
+                .find(|known| kind.eq_ignore_ascii_case(known))
+                .unwrap_or("other");
+            *counts.entry(kind.to_string()).or_default() += 1;
+        }
+        ControlFlow::Continue(())
+    })
+    .map_err(err)?;
+    if invalid > 0 {
+        return Err(DataError::Format(format!(
+            "GeoPackage: {invalid} invalid gpkg_contents entry/entries: table_name and data_type must be text"
+        )));
+    }
+    Ok(counts.into_iter().collect())
+}
+
 impl GpkgMemSource {
     /// Opens a feature table (default: the first) of the GeoPackage in `bytes`.
     pub fn open_shared(bytes: Shared, layer: Option<&str>) -> Result<Self> {
@@ -118,7 +176,7 @@ impl GpkgMemSource {
             code: int(get(r, "organization_coordsys_id")),
             definition: text(get(r, "definition")),
         });
-        let reproject = super::gpkg_reproject(srs_id, row, &mut notes);
+        let reproject = super::gpkg_reproject(srs_id, row, &mut notes)?;
 
         let table = schema
             .iter()
@@ -161,7 +219,7 @@ impl GpkgMemSource {
             count: Some(count),
             // A system the definition gives, by its PROJ definition, so the layer keeps it
             // (`SourceInfo::coordinate_system`), as a Shapefile's .prj does (#1476).
-            crs: reproject.crs.custom_def().map(|d| d.proj4.clone()).unwrap_or_else(|| reproject.label()),
+            crs: reproject.info_crs(),
             indexed: false,
             notes,
             zm_dropped: false,

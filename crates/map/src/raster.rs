@@ -61,6 +61,12 @@ pub struct RasterLayer {
     /// A remote reload shared with render snapshots, never serialized.
     #[serde(skip)]
     opening: Option<RasterRead>,
+    /// The initiating read's runtime lifetime, retained through queued application and retry.
+    #[serde(skip)]
+    read_still: Option<rustgis_data::source::remote::Still>,
+    /// Process-local opening identity; render and undo copies retain it, new reads do not.
+    #[serde(skip, default = "next_read_generation")]
+    read_generation: u64,
     /// The style is the file's own look once its pixels land (a layer added before they have;
     /// saved with a project saved before they did, so it opens in that look still).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -177,6 +183,28 @@ impl std::fmt::Debug for RasterLayer {
 }
 
 impl RasterLayer {
+    /// Whether a captured opening still owns the live source and any deferred address look.
+    pub fn same_opening(&self, other: &Self) -> bool {
+        self.read_generation == other.read_generation && self.restyle == other.restyle && self.look == other.look
+    }
+
+    /// Detaches a fully read replacement from the prior opening's pending reads and notices.
+    pub fn reset_replacement_read(&mut self) {
+        self.read_generation = next_read_generation();
+        self.masked = MaskedStats::default();
+        self.opening = None;
+        self.read_still = None;
+        self.restyle = false;
+        self.look = None;
+        self.pixels_said = false;
+        self.error_said = false;
+        self.failed_at = None;
+        self.failures = 0;
+        self.lost_said = false;
+        self.look_lost = None;
+        self.dropped.clear();
+    }
+
     /// Reads a replacement without silently changing the renderer or resetting its style.
     pub fn relinked(&self, path: &str, subdataset: Option<&str>) -> Result<RasterLayer, String> {
         if self.embedded.is_some() {
@@ -185,22 +213,14 @@ impl RasterLayer {
         if self.in_place {
             return Err("the raster is read in place by its address: add the address again to change it".into());
         }
+        if !crate::paths::is_local(path) {
+            return Err("give a raster file or Zarr store on this computer: web addresses aren't repaired here".into());
+        }
         let sub = subdataset.or(self.subdataset.as_deref());
         let r = rustgis_data::raster::read_path_with(std::path::Path::new(path), sub, self.crs.as_deref())
             .and_then(|r| placed(r, self.placement))
             .map_err(|e| format!("{path}: {e}"))?;
-        let need = self.style.renderer.bands().into_iter().max().map_or(1, |b| b.saturating_add(1));
-        if r.band_count() < need {
-            return Err(format!(
-                "{path} has {} band(s); the layer's style draws band {need}: choose a raster with at least {need} bands",
-                r.band_count()
-            ));
-        }
-        if matches!(self.style.renderer, RasterRenderer::Colormap) && !matches!(r.color, ColorHint::Palette(_)) {
-            return Err(format!(
-                "{path} has no color palette; the layer's Colormap style uses the file's palette: choose a raster with a color palette"
-            ));
-        }
+        self.validate_replacement(&r, path)?;
         let mut style = self.style.clone();
         style.repair(&r);
         Ok(RasterLayer {
@@ -217,6 +237,8 @@ impl RasterLayer {
             error: None,
             masked: MaskedStats::default(),
             opening: None,
+            read_still: None,
+            read_generation: next_read_generation(),
             restyle: false,
             look: None,
             pixels_said: false,
@@ -227,6 +249,23 @@ impl RasterLayer {
             look_lost: None,
             dropped: Vec::new(),
         })
+    }
+
+    /// Checks a fresh candidate without changing the configured renderer or its palette.
+    pub fn validate_replacement(&self, r: &Raster, path: &str) -> Result<(), String> {
+        let need = self.style.renderer.bands().into_iter().max().map_or(1, |b| b.saturating_add(1));
+        if r.band_count() < need {
+            return Err(format!(
+                "{path} has {} band(s); the layer's style draws band {need}: choose a raster with at least {need} bands",
+                r.band_count()
+            ));
+        }
+        if matches!(self.style.renderer, RasterRenderer::Colormap) && !matches!(r.color, ColorHint::Palette(_)) {
+            return Err(format!(
+                "{path} has no color palette; the layer's Colormap style uses the file's palette: choose a raster with a color palette"
+            ));
+        }
+        Ok(())
     }
 
     /// A raster read from a file on disk.
@@ -246,6 +285,8 @@ impl RasterLayer {
             error: None,
             masked: MaskedStats::default(),
             opening: None,
+            read_still: None,
+            read_generation: next_read_generation(),
             restyle: false,
             look: None,
             pixels_said: false,
@@ -275,6 +316,8 @@ impl RasterLayer {
             error: None,
             masked: MaskedStats::default(),
             opening: None,
+            read_still: None,
+            read_generation: next_read_generation(),
             restyle: false,
             look: None,
             pixels_said: false,
@@ -309,6 +352,8 @@ impl RasterLayer {
             error: None,
             masked: MaskedStats::default(),
             opening: None,
+            read_still: None,
+            read_generation: next_read_generation(),
             restyle: true,
             look: None,
             pixels_said: false,
@@ -358,6 +403,9 @@ impl RasterLayer {
     /// [`RasterLayer::reload`] natively). What it can't start (no address, an address that isn't a
     /// tile layer's, no reader here) is the caller's to say.
     fn begin_in_place_read(&mut self) -> Result<(), String> {
+        use rustgis_data::source::remote;
+        let still = remote::current_still();
+        remote::check_still(&still)?;
         let Some(address) = self.path.clone() else { return Err("the raster has no source".to_string()) };
         // Checked as a tile layer's address is (http(s) or s3, a host, no control characters): a
         // project edited by hand asks for nothing else.
@@ -369,10 +417,11 @@ impl RasterLayer {
         let slot = Arc::new(Mutex::new(None));
         let land = slot.clone();
         self.opening = Some(slot);
+        self.read_still = still.clone();
         reader(
             &address,
             Box::new(move |result| {
-                *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.map(Arc::new));
+                *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(remote::check_still(&still).and(result.map(Arc::new)));
                 crate::source::wake();
             }),
         );
@@ -399,7 +448,14 @@ impl RasterLayer {
         if self.read_failure().is_none() {
             return;
         }
-        if let Err(e) = self.begin_in_place_read() {
+        use rustgis_data::source::remote;
+        let still = self.read_still.clone();
+        if let Err(e) = remote::check_still(&still) {
+            self.fail(e);
+            return;
+        }
+        self.read_generation = next_read_generation();
+        if let Err(e) = remote::with_optional_still(still, || self.begin_in_place_read()) {
             self.land(Err(e));
         }
     }
@@ -423,6 +479,11 @@ impl RasterLayer {
         if self.time_zarr.is_some() {
             return Ok(());
         }
+        use rustgis_data::source::remote;
+        let still = remote::current_still();
+        remote::check_still(&still)?;
+        self.read_generation = next_read_generation();
+        self.read_still = still;
         self.opening = None;
         self.error = None;
         self.failed_at = None;
@@ -458,16 +519,17 @@ impl RasterLayer {
             let placement = self.placement;
             let slot = Arc::new(Mutex::new(None));
             let land = slot.clone();
+            let still = self.read_still.clone();
             self.data = None;
             self.opening = Some(slot);
             rustgis_data::source::remote::fetch_whole(
                 path,
                 Box::new(move |result| {
-                    let result = result
-                        .map_err(|e| match e {
+                    let result = remote::check_still(&still)
+                        .and(result.map_err(|e| match e {
                             rustgis_data::source::remote::Failed::Other(message) => message,
                             _ => "The raster could not be downloaded.".to_string(),
-                        })
+                        }))
                         .and_then(|bytes| {
                             rustgis_data::raster::read_bytes(&name, &bytes)
                                 .and_then(|r| placed(r, placement))
@@ -510,6 +572,11 @@ impl RasterLayer {
     fn wait_for_read(&mut self, deadline: Instant) -> Result<(), String> {
         let Some(slot) = self.opening.clone() else { return Ok(()) };
         loop {
+            if let Err(e) = rustgis_data::source::remote::check_still(&self.read_still) {
+                self.opening = None;
+                self.fail(e.clone());
+                return Err(e);
+            }
             if let Some(result) = slot.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                 self.opening = None;
                 let error = result.as_ref().err().cloned();
@@ -582,6 +649,12 @@ impl RasterLayer {
     /// Installs a completed remote read; each render copy can observe the same shared result.
     pub(crate) fn poll_reload(&mut self) -> bool {
         let Some(slot) = self.opening.as_ref() else { return false };
+        if let Err(e) = rustgis_data::source::remote::check_still(&self.read_still) {
+            self.opening = None;
+            self.fail(e);
+            crate::source::another_frame();
+            return false;
+        }
         let Some(result) = slot.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return true };
         self.opening = None;
         self.land(result);
@@ -662,7 +735,7 @@ pub const MAX_ZARR_STEPS: usize = crate::time::MAX_STEPS;
 
 /// A Zarr variable that follows the time slider: the store (a folder or a web address), the
 /// variable, the other dimensions' fixed steps, and its time dimension's steps as dates.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ZarrTime {
     /// The store's folder or web address.
@@ -684,6 +757,31 @@ pub struct ZarrTime {
     /// The step whose slice the layer holds (an index into `dates`); `None` when none is.
     #[serde(skip)]
     pub shown: Option<usize>,
+    /// Process-local read generation: explicit reload must not reuse old slices or pending reads.
+    #[serde(skip, default = "next_read_generation")]
+    pub read_generation: u64,
+}
+
+/// A process-local identity for a fresh Zarr opening or independent analysis invocation.
+pub fn next_read_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Default for ZarrTime {
+    fn default() -> Self {
+        Self {
+            store: String::new(),
+            variable: String::new(),
+            index: Vec::new(),
+            dim: String::new(),
+            offset: 0,
+            dates: Vec::new(),
+            crs: None,
+            shown: None,
+            read_generation: next_read_generation(),
+        }
+    }
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -1207,6 +1305,17 @@ impl RasterStyle {
         }
     }
 
+    /// Flips a Stretch's colour scheme end for end (#1355). Returns false for other renderers.
+    pub fn invert_ramp(&mut self) -> bool {
+        match &mut self.renderer {
+            RasterRenderer::Stretch { invert, .. } => {
+                *invert = !*invert;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Recolours with a colour scheme.
     pub fn set_ramp(&mut self, ramp: Ramp) {
         match &mut self.renderer {
@@ -1551,8 +1660,92 @@ impl RasterLayer {
     }
 }
 
+impl RasterLayer {
+    /// Only owning address/path strings are offered; embedded bytes and render state stay opaque.
+    pub(crate) fn output_slots(&self) -> Vec<(crate::LayerRole, &str, bool, bool)> {
+        let RasterLayer {
+            path,
+            file_name: _,
+            embedded,
+            subdataset: _,
+            crs: _,
+            time_zarr,
+            placement: _,
+            style: _,
+            data: _,
+            error: _,
+            masked: _,
+            opening: _,
+            read_still: _,
+            read_generation: _,
+            in_place: _,
+            restyle: _,
+            look: _,
+            pixels_said: _,
+            error_said: _,
+            failed_at: _,
+            failures: _,
+            lost_said: _,
+            look_lost: _,
+            dropped: _,
+        } = self;
+        let mut out = Vec::new();
+        if let Some(p) = path {
+            out.push((crate::LayerRole::Raster, p.as_str(), true, embedded.is_none() && crate::paths::is_local(p)));
+        }
+        if let Some(ZarrTime { store, variable: _, index: _, dim: _, offset: _, dates: _, crs: _, shown: _, read_generation: _ }) =
+            time_zarr
+        {
+            out.push((crate::LayerRole::ZarrStore, store.as_str(), true, crate::paths::is_local(store)));
+        }
+        out
+    }
+
+    /// Looks up a prepared address/path field without allocation.
+    pub(crate) fn output_slot_mut(&mut self, role: crate::LayerRole) -> Option<&mut String> {
+        match role {
+            crate::LayerRole::Raster => self.path.as_mut(),
+            crate::LayerRole::ZarrStore => Some(&mut self.time_zarr.as_mut()?.store),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// A completed read can wait for a render copy or the blocking consumer. Revocation
+    /// between callback and application must refuse both consumers of the shared slot.
+    #[test]
+    fn permission_policy_completed_raster_checks_lifetime_at_application() {
+        use rustgis_data::source::remote;
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let previous = in_place_reader().lock().unwrap().take();
+        set_in_place_reader(|_, done| done(Ok(dem())));
+        let mut failures = Vec::new();
+        for revoke in [false, true] {
+            let live = Arc::new(AtomicBool::new(true));
+            let flag = live.clone();
+            let still: remote::Still = Arc::new(move || flag.load(SeqCst));
+            let mut layer = remote::with_still(still, || RasterLayer::opening_in_place("https://raster-landing.invalid/scene.tif"));
+            assert!(layer.data.is_none() && layer.opening.as_ref().unwrap().lock().unwrap().is_some(), "callback completed before poll");
+            let mut render_copy = layer.clone();
+            live.store(!revoke, SeqCst);
+            assert!(!layer.poll_reload());
+            if layer.data.is_some() == revoke {
+                failures.push(format!("render application ignored revoke={revoke}"));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let r = render_copy.wait_for_read(Instant::now() + web_time::Duration::from_secs(1));
+                if r.is_ok() == revoke || render_copy.data.is_some() == revoke {
+                    failures.push(format!("blocking application ignored revoke={revoke}"));
+                }
+            }
+        }
+        *in_place_reader().lock().unwrap() = previous;
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
     use rustgis_data::raster::{Crs, GeoTransform};
 
     use super::*;
@@ -1599,6 +1792,7 @@ mod tests {
                 dates,
                 crs: None,
                 shown: Some(1),
+                read_generation: 0,
             };
             z.repair();
             z
