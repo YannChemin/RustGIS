@@ -762,7 +762,7 @@ its standard input and output: no port, no token, nothing another program can jo
   line `{"session": {"abi": 1, "plugin": "<id>", "rustgis": "<version>", "lang": "<code>"}}`.
 - Each command comes as `{"command": request, "id": n}`, where `request` is what a per-call
   program gets. The program answers `{"ok": value, "id": n}` or `{"error": "text", "id": n}`,
-  within 2 minutes.
+  within 2 minutes, or the command's `timeout`.
 - At any time, during a command or between commands, the program can send a host request
   `{"call": {"op": "...", "params": {...}}, "id": "any"}`. RustGIS answers
   `{"ok": value, "id": "any"}` or `{"error": "text", "id": "any"}`; the `id` is optional and comes

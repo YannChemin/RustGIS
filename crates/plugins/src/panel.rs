@@ -181,6 +181,23 @@ impl FormField {
         }
     }
 
+    /// Whether taking `v` loses part of it: a text clipped, or a choice not among `choices`
+    /// left out of a set of them.
+    fn lossy(&self, v: &Value) -> bool {
+        match self.kind.as_str() {
+            "text" => v.as_str().is_some_and(|s| s.chars().count() > MAX_STATE_TEXT),
+            "multi" => {
+                let parts: Vec<Option<&str>> = match v {
+                    Value::Array(a) => a.iter().map(Value::as_str).collect(),
+                    Value::String(s) => s.split(',').map(|p| Some(p.trim())).collect(),
+                    _ => return false,
+                };
+                parts.into_iter().any(|p| p.is_none_or(|p| !self.choices.contains(&clip(p, MAX_STATE_LABEL))))
+            }
+            _ => false,
+        }
+    }
+
     /// The value it has when the plugin gave none: its default, or an empty one of its kind.
     fn initial(&self) -> Value {
         self.default.as_ref().and_then(|d| self.value_of(d)).unwrap_or_else(|| match self.kind.as_str() {
@@ -625,52 +642,87 @@ fn holds(nodes: &[TreeNode], id: &str) -> bool {
 }
 
 /// The fields in `given` (`[{"id", "kind", "label"?, "help"?, "choices"?, "default"?,
-/// "required"?, "integer"?}]`), at most [`MAX_FORM_FIELDS`] of them. A field with an id taken
-/// already, an unknown kind, or no choices when it needs them is left out.
-fn form_fields(given: &[Value]) -> Vec<FormField> {
+/// "required"?, "integer"?}]`), at most [`MAX_FORM_FIELDS`] of them, for form `item`. A field
+/// that isn't an object, has no valid id or one taken already, an unknown kind, or no choices
+/// when it needs them is left out; past the limits, fields and choices are left out, and long
+/// labels, choices and help clipped. Each is counted in `dropped`.
+fn form_fields(item: &str, given: &[Value], dropped: &mut Dropped) -> Vec<FormField> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for f in given.iter().take(MAX_FORM_FIELDS) {
-        let Some(id) = f.get("id").and_then(Value::as_str).filter(|i| i.chars().count() <= MAX_FORM_FIELD_ID) else {
+    for (i, f) in given.iter().enumerate() {
+        let id = f.get("id").and_then(Value::as_str);
+        // Named by its id where it has one, else by its place in the list.
+        let name = id.map_or_else(|| format!("{item}.fields[{i}]"), |id| format!("{item}.fields.{id}"));
+        if i >= MAX_FORM_FIELDS {
+            dropped.field(name);
+            continue;
+        }
+        let Some(id) = id.filter(|i| i.chars().count() <= MAX_FORM_FIELD_ID) else {
+            dropped.field(name);
             continue;
         };
         if !crate::manifest::valid_id(id, true) || !seen.insert(id.to_string()) {
+            dropped.field(name);
             continue;
         }
         let Some(kind) =
             f.get("kind").and_then(Value::as_str).filter(|k| matches!(*k, "text" | "number" | "checkbox" | "select" | "multi"))
         else {
+            dropped.field(name);
             continue;
         };
         let mut choices: Vec<String> = Vec::new();
         if matches!(kind, "select" | "multi") {
-            let Some(list) = f.get("choices").and_then(Value::as_array) else { continue };
+            let Some(list) = f.get("choices").and_then(Value::as_array) else {
+                dropped.field(name);
+                continue;
+            };
+            let mut lost = list.len() > MAX_FORM_CHOICES;
             for c in list.iter().take(MAX_FORM_CHOICES) {
-                let Some(c) = c.as_str() else { continue };
+                let Some(c) = c.as_str() else {
+                    lost = true;
+                    continue;
+                };
+                if c.chars().count() > MAX_STATE_LABEL {
+                    dropped.clip_label(&format!("{name}.choices"));
+                }
                 let c = clip(c, MAX_STATE_LABEL);
                 if !choices.contains(&c) {
                     choices.push(c);
                 }
             }
+            if lost {
+                dropped.field(format!("{name}.choices"));
+            }
             if choices.is_empty() {
+                dropped.field(name);
                 continue;
             }
+        }
+        let label = f.get("label").and_then(Value::as_str).filter(|l| !l.trim().is_empty());
+        if label.is_some_and(|l| l.chars().count() > MAX_STATE_LABEL) {
+            dropped.clip_label(&name);
+        }
+        let help = f.get("help").and_then(Value::as_str).unwrap_or_default();
+        if help.chars().count() > MAX_DECLARED {
+            dropped.clip_field(format!("{name}.help"));
         }
         let mut field = FormField {
             id: id.to_string(),
             kind: kind.to_string(),
-            label: f
-                .get("label")
-                .and_then(Value::as_str)
-                .filter(|l| !l.trim().is_empty())
-                .map_or_else(|| id.to_string(), |l| clip(l, MAX_STATE_LABEL)),
-            help: f.get("help").and_then(Value::as_str).map(|h| clip(h, MAX_DECLARED)).unwrap_or_default(),
+            label: label.map_or_else(|| id.to_string(), |l| clip(l, MAX_STATE_LABEL)),
+            help: clip(help, MAX_DECLARED),
             choices,
             default: None,
             required: f.get("required").and_then(Value::as_bool).unwrap_or(false),
             integer: f.get("integer").and_then(Value::as_bool).unwrap_or(false),
         };
-        field.default = f.get("default").and_then(|d| field.value_of(d));
+        if let Some(d) = f.get("default").filter(|d| !d.is_null()) {
+            field.default = field.value_of(d);
+            if field.default.is_none() || field.lossy(d) {
+                dropped.field(format!("{name}.default"));
+            }
+        }
         out.push(field);
     }
     out
@@ -868,6 +920,22 @@ impl PanelState {
         }
         for id in set {
             let (Some(item), Some(input), Some(kept)) = (decl.item(id), given.get(id), self.values.get(id)) else { continue };
+            // A form takes what it can field by field: one it doesn't hold, or a value that
+            // isn't that field's, is not taken; one taken in part is adjusted.
+            if item.kind == "form" {
+                let fields = self.items.get(id.as_str()).map_or(&[][..], |s| s.fields.as_slice());
+                for (name, raw) in input.as_object().into_iter().flatten() {
+                    match fields.iter().find(|f| f.id == *name) {
+                        Some(f) if f.value_of(raw).is_some() => {
+                            if f.lossy(raw) {
+                                dropped.adjusted.push(format!("{id}.{name}"));
+                            }
+                        }
+                        _ => dropped.rejected_value(&format!("{id}.{name}")),
+                    }
+                }
+                continue;
+            }
             let changed = match item.kind.as_str() {
                 "slider" => whole(input) != whole(kept),
                 "range" => pair(input) != pair(kept),
@@ -1034,7 +1102,7 @@ impl PanelState {
             if d.kind == "form"
                 && let Some(fields) = u.get("fields").and_then(Value::as_array)
             {
-                st.fields = Arc::new(form_fields(fields));
+                st.fields = Arc::new(form_fields(id, fields, &mut dropped));
             }
         }
         if let Some(values) = update.get("values") {
@@ -1058,7 +1126,20 @@ impl PanelState {
                     *v = json!([a.min(b), a.max(b)]);
                 }
                 "tree" | "choice" if v.as_str().is_some_and(|n| !holds(&st.nodes, n)) => *v = Value::Null,
-                "form" => *v = normalized_form(&st.fields, v),
+                "form" => {
+                    // A field the plugin added starts at its default and one it removed goes
+                    // with it: neither is a value changed. One kept but no longer fitting is.
+                    let after = normalized_form(&st.fields, v);
+                    let kept_changed = before
+                        .as_object()
+                        .zip(after.as_object())
+                        .is_some_and(|(b, a)| b.iter().any(|(k, x)| a.get(k).is_some_and(|y| y != x)));
+                    *v = after;
+                    if kept_changed && !dropped.adjusted.iter().any(|given| given == id) {
+                        dropped.adjusted.push(id.to_string());
+                    }
+                    continue;
+                }
                 _ => {}
             }
             if *v != before && !dropped.adjusted.iter().any(|given| given == id) {
@@ -1148,6 +1229,43 @@ mod tests {
     }
 
     #[test]
+    fn a_form_says_what_it_leaves_out_and_nothing_when_it_takes_all() {
+        let d = form_decl();
+        let mut s = PanelState::new(&d);
+        // Fields given for the first time, without values, start at their defaults quietly.
+        assert_eq!(s.apply(&d, &fields()).notice(), None);
+        // As do fields replaced by others (a module switched).
+        let other = json!({"items": {"form": {"fields": [{"id": "level", "kind": "number"}]}}});
+        assert_eq!(s.apply(&d, &other).notice(), None);
+        assert_eq!(s.apply(&d, &json!({"values": {"form": {"level": 4}}})).notice(), None);
+        // Fields it can't take are named.
+        let bad = json!({"items": {"form": {"fields": [
+            {"id": "ok", "kind": "text"},
+            {"id": "ok", "kind": "text"},
+            {"id": "what", "kind": "unknown"},
+            {"kind": "text"},
+            {"id": "pick", "kind": "select", "choices": ["a", 7], "default": "zzz"}
+        ]}}});
+        let notice = s.apply(&d, &bad).notice().unwrap_or_default();
+        for name in ["form.fields.ok", "form.fields.what", "form.fields[3]", "form.fields.pick.choices", "form.fields.pick.default"] {
+            assert!(notice.contains(name), "{name} in {notice}");
+        }
+        // So are values it can't take, field by field, and one taken in part.
+        let notice = s.apply(&d, &json!({"values": {"form": {"ok": "x", "nope": 1, "pick": 3}}})).notice().unwrap_or_default();
+        assert!(notice.contains("form.nope") && notice.contains("form.pick"), "{notice}");
+        assert!(!notice.contains("form.ok"), "{notice}");
+        assert_eq!(s.form("form").unwrap()["ok"], json!("x"));
+        let long = "x".repeat(MAX_STATE_TEXT + 1);
+        let notice = s.apply(&d, &json!({"values": {"form": {"ok": long}}})).notice().unwrap_or_default();
+        assert!(notice.contains("adjusted") && notice.contains("form.ok"), "{notice}");
+        // Past the limit, fields are left out and counted.
+        let many: Vec<Value> = (0..MAX_FORM_FIELDS + 3).map(|i| json!({"id": format!("f{i}"), "kind": "text"})).collect();
+        let mut dropped = Dropped::default();
+        assert_eq!(form_fields("form", &many, &mut dropped).len(), MAX_FORM_FIELDS);
+        assert_eq!(dropped.fields.len() + dropped.unlisted_fields, 3);
+    }
+
+    #[test]
     fn a_form_ignores_fields_and_values_it_cannot_take() {
         let d = form_decl();
         let mut s = PanelState::new(&d);
@@ -1183,10 +1301,16 @@ mod tests {
     fn long_choices_match_as_clipped_and_whole_numbers_are_bounded_as_given() {
         let long = "c".repeat(MAX_STATE_LABEL + 20);
         let clipped = "c".repeat(MAX_STATE_LABEL);
-        let fields = form_fields(&[
-            json!({"id": "pick", "kind": "select", "choices": [long.clone()], "default": long.clone()}),
-            json!({"id": "many", "kind": "multi", "choices": [long.clone()]}),
-        ]);
+        let mut dropped = Dropped::default();
+        let fields = form_fields(
+            "form",
+            &[
+                json!({"id": "pick", "kind": "select", "choices": [long.clone()], "default": long.clone()}),
+                json!({"id": "many", "kind": "multi", "choices": [long.clone()]}),
+            ],
+            &mut dropped,
+        );
+        assert_eq!(dropped.labels, 2, "each long choice is said to be clipped");
         assert_eq!(fields[0].default, Some(json!(clipped)), "a default longer than its choice still matches");
         assert_eq!(fields[0].value_of(&json!(long)), Some(json!(clipped)));
         assert_eq!(fields[1].value_of(&json!([long])), Some(json!([clipped])), "a selection longer than its choice is kept");

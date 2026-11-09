@@ -154,6 +154,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let pane = &mut app.ui.plugin_panel;
     if pane.drawn.saturating_add(1) < frame {
         pane.date_text.clear();
+        pane.typing.clear();
         pane.dragging = None;
         pane.range_drag = None;
     }
@@ -272,14 +273,18 @@ fn form(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, stat
                 let text = RichText::new(if f.required { format!("{} *", f.label) } else { f.label.clone() }).size(11.0).color(t.text_dim);
                 // A form label wraps in a narrow column instead of widening it: a long
                 // description would otherwise push the field's value box out of the pane.
-                ui.scope(|ui| {
-                    ui.set_max_width(96.0);
-                    ui.add(egui::Label::new(text).wrap());
-                });
+                // The label names its widget for screen readers.
+                let named = ui
+                    .scope(|ui| {
+                        ui.set_max_width(96.0);
+                        ui.add(egui::Label::new(text).wrap())
+                    })
+                    .inner
+                    .id;
                 match f.kind.as_str() {
                     "checkbox" => {
                         let mut v = state.form_value(id, &f.id).and_then(Value::as_bool).unwrap_or(false);
-                        let r = ui.checkbox(&mut v, "");
+                        let r = ui.checkbox(&mut v, "").labelled_by(named);
                         let r = if f.help.is_empty() { r } else { r.on_hover_text(tr(&f.help)) };
                         if r.changed() {
                             changes.push((f.id.clone(), json!(v)));
@@ -296,8 +301,9 @@ fn form(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, stat
                                     }
                                 }
                             });
+                        let r = r.response.labelled_by(named);
                         if !f.help.is_empty() {
-                            r.response.on_hover_text(tr(&f.help));
+                            r.on_hover_text(tr(&f.help));
                         }
                     }
                     "multi" => {
@@ -321,8 +327,9 @@ fn form(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, stat
                                     }
                                 }
                             });
+                        let r = r.response.labelled_by(named);
                         if !f.help.is_empty() {
-                            r.response.on_hover_text(tr(&f.help));
+                            r.on_hover_text(tr(&f.help));
                         }
                     }
                     kind => {
@@ -336,7 +343,7 @@ fn form(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, stat
                             }
                             None => stored.clone(),
                         };
-                        let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(160.0));
+                        let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(160.0)).labelled_by(named);
                         let bad = kind == "number" && typed_value(f, &text).is_none();
                         if bad {
                             ui.painter().rect_stroke(r.rect, CornerRadius::same(3), Stroke::new(1.0, t.red), egui::StrokeKind::Inside);
@@ -352,7 +359,7 @@ fn form(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, stat
                             let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
                             if let Some(v) = typed_value(f, &text)
                                 && !escaped
-                                && state.form_value(id, &f.id) != Some(&v)
+                                && !same_value(state.form_value(id, &f.id), &v)
                             {
                                 changes.push((f.id.clone(), v));
                             }
@@ -382,6 +389,15 @@ fn shown_value(v: &Value) -> String {
     }
 }
 
+/// Whether `stored` already holds `v`: numbers compare by value, so `0` is `0.0`.
+fn same_value(stored: Option<&Value>, v: &Value) -> bool {
+    match (stored, v) {
+        (Some(Value::Number(a)), Value::Number(b)) => a.as_f64() == b.as_f64(),
+        (Some(a), b) => a == b,
+        (None, _) => false,
+    }
+}
+
 /// A text or number field's value from what the user typed: a whole number for an integer
 /// field, a finite number for the other, and the text itself otherwise.
 fn typed_value(f: &FormField, text: &str) -> Option<Value> {
@@ -390,7 +406,9 @@ fn typed_value(f: &FormField, text: &str) -> Option<Value> {
     }
     // A whole number is read as it is typed, so one past the range the backend keeps (2^53) is
     // refused rather than rounded to it.
-    if f.integer && let Ok(i) = text.trim().parse::<i64>() {
+    if f.integer
+        && let Ok(i) = text.trim().parse::<i64>()
+    {
         return (i.unsigned_abs() <= 9_007_199_254_740_992).then(|| json!(i));
     }
     let n: f64 = text.trim().parse().ok().filter(|n: &f64| n.is_finite())?;
@@ -1009,6 +1027,9 @@ mod tests {
         assert_eq!(typed_value(&field(false), "x"), None);
         assert_eq!(typed_value(&field(false), "inf"), None);
         assert_eq!(typed_value(&field(false), ""), None);
+        assert!(same_value(Some(&json!(0)), &json!(0.0)), "a number left as it was isn't sent");
+        assert!(!same_value(Some(&json!(0)), &json!(0.5)));
+        assert!(!same_value(None, &json!(0)));
         assert_eq!(shown_value(&json!(2)), "2");
         assert_eq!(shown_value(&json!("two")), "two");
     }

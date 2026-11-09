@@ -453,6 +453,10 @@ fn converse(stdin: &Writer, rx: &Receiver<Line>, host: &mut dyn Host, request: &
                 continue;
             }
         };
+        // Reading a long line takes time too: what it says is not acted on past the deadline.
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err("it ran too long and was stopped".into());
+        }
         if let Some(c) = msg.get("call") {
             calls += 1;
             if calls > MAX_HOST_CALLS {
