@@ -3000,7 +3000,7 @@ fn load_all(s: &mut Session, p: &Value) -> CmdResult {
     ds.name = l.dataset.name.clone();
     let (n, name) = (ds.features.len(), l.name.clone());
     if unread > 0 {
-        s.warn(format!("{name}: {unread} rows couldn't be read and were left out"));
+        s.warn(super::whole::unread_notice(&name, unread));
     }
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     l.dataset = ds;
@@ -3340,7 +3340,8 @@ pub(crate) fn fixed_download_urls(p: &Value) -> Option<Vec<String>> {
 /// they are.
 pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
     let owner = s.continuation()?;
-    let out = add_url_as_given(s, p).map_err(|e| crate::sources::redact_text(&e))?;
+    let url = ps(p, "url").map(str::trim).unwrap_or("");
+    let out = add_url_as_given(s, p).map_err(|e| crate::sources::message_with_address(url, &e))?;
     s.check_continuation(&owner)?;
     Ok(out)
 }
@@ -3360,6 +3361,15 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
     // adding it answered, as often as the run asks for it (the app downloaded and added it once).
     // Answering it changes nothing (the layer is its own undo step).
     let wanted = s.asked_for(p);
+    // A window of the view is answered by the one asked in the view the command sees now.
+    #[cfg(not(target_arch = "wasm32"))]
+    let wanted = match p.get("bbox") {
+        Some(b) if s.leave_downloads && is_view(Some(b)) => {
+            let at = ps(p, "url").map(str::trim).unwrap_or_default();
+            Session::with_view(&wanted, Some(window_settled(s, p, at, None)?.bbox))
+        }
+        _ => wanted,
+    };
     if s.leave_downloads
         && let Some((answer, added)) = s.rerun_answer(&wanted)
     {
@@ -3384,10 +3394,16 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
             .and_then(Value::as_u64)
             .is_some_and(|id| u32::try_from(id).ok().and_then(|id| s.map().layer(id)).is_none());
         if missing || added.gone(s.map()) {
-            return Err(format!("{url}: the layer its download added was removed or undone before the command ran again"));
+            return Err(crate::sources::message_with_address(
+                url,
+                "the layer its download added was removed or undone before the command ran again",
+            ));
         }
         if super::plugins::fetch::table_gone(&answer, &s.project) {
-            return Err(format!("{url}: the table its download added was removed or undone before the command ran again"));
+            return Err(crate::sources::message_with_address(
+                url,
+                "the table its download added was removed or undone before the command ran again",
+            ));
         }
         return added.answer_now(s.map(), &answer);
     }
@@ -3404,13 +3420,20 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
     }
     if window {
         window_checks(p, url, scan)?;
-        // A plugin's command run by the app leaves what would wait to the app, off the frame; a
-        // window waits for its header and tiles, which the app doesn't take over yet.
+        // A plugin's command run by the app leaves what would wait to the app, off the frame
+        // ([`read_cog_window`]); a box that can't be read is refused now, while the command runs.
         #[cfg(not(target_arch = "wasm32"))]
         if s.leave_downloads {
-            return Err(format!(
-                "{url}: a window (\"bbox\") waits for its tiles, which a plugin's command can't do in the app yet: run layer.addUrl from the command line or a script, or leave out \"bbox\" to draw the file in place"
-            ));
+            let settled = window_settled(s, p, url, None)?;
+            let mut asked = p.clone();
+            asked["url"] = json!(url);
+            // `"view"` is the view now: the app reads the window on a later frame, and a command
+            // run again after a download sees the view it first ran with only while it runs. The
+            // request keeps the box beside what was asked, by which a run again is answered.
+            s.window_view = is_view(p.get("bbox")).then_some(settled.bbox);
+            let queued = s.request_url(&asked);
+            s.window_view = None;
+            return queued;
         }
         return add_cog_window(s, p, url);
     }
@@ -3488,13 +3511,9 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        // Errors name the address without its keys, and any address they quote (a redirect's)
-        // without its keys too; those about the address itself name it already.
-        let shown = crate::sources::redact(url);
-        let named = |e: String| match e.strip_prefix(url).or_else(|| e.strip_prefix(shown.as_str())) {
-            Some(rest) => format!("{shown}{}", crate::sources::redact_text(rest)),
-            None => format!("{shown}: {}", crate::sources::redact_text(&e)),
-        };
+        // Redact the known address before composing any reason: a query value can contain
+        // unescaped whitespace, so splitting an arbitrary error into URL words is not safe.
+        let named = |e: String| crate::sources::message_with_address(url, &e);
         // An address without a file name may be a GeoTIFF too: its first bytes are read to see,
         // and anything that doesn't answer as one is downloaded whole, as before.
         let unnamed = !tiff && is_unnamed_url(url);
@@ -3581,8 +3600,8 @@ fn is_zip(bytes: &[u8]) -> bool {
 /// A Shapefile's `.shp` or part that failed, named by its address without its keys or signature
 /// (the `.shp`'s query, which the parts carry too).
 fn part_failed(url: &str, e: String) -> String {
-    let e = e.strip_prefix(url).map(|r| r.trim_start_matches(": ").to_string()).unwrap_or(e);
-    format!("{}: {}{}", crate::sources::redact(url), crate::sources::redact_text(&e), status_hint(url, &e))
+    let why = status_hint(url, &e);
+    format!("{}{why}", crate::sources::message_with_address(url, &e))
 }
 
 /// What a Shapefile's 403 may mean: S3 answers a signed request for a file that isn't there as it
@@ -3707,10 +3726,10 @@ pub fn download_data(url: &str, max: usize, done: crate::render::rustgis_tiles::
                 let left = max.saturating_sub(shp.len());
                 download_parts(name, shp, parts.into_iter(), Vec::new(), left, done);
             }
-            // The app names the address it asked for (redacted), as for any download.
+            // Name the complete known address before the app or session redacts this again.
             Err(e) => {
                 let why = status_hint(&shp_url, &e);
-                done(Err(format!("{}{why}", crate::sources::redact_text(&e))))
+                done(Err(format!("{}{why}", crate::sources::message_with_address(&shp_url, &e))))
             }
         }),
     );
@@ -3921,15 +3940,10 @@ pub(crate) fn add_cog_with(s: &mut Session, p: &Value, url: &str, strict: bool, 
             s.notify(format!("{shown}: {line}"), false);
         }
     } else if probed || why.is_some() || r.get("dated").is_some() {
-        // Added, but its (first date's) file couldn't be read: the view stays where it was, and
-        // the answer says why when the read said (its keys left out).
+        // Added, but its (first date's) file couldn't be read: the view stays where it was.
         r["warning"] = json!(match why {
-            Some(e) => format!(
-                "{} couldn't be read ({}), so the map wasn't moved to it",
-                crate::sources::redact(&url),
-                crate::sources::redact_text(&e)
-            ),
-            None => format!("{} couldn't be read yet, so the map wasn't moved to it", crate::sources::redact(&url)),
+            Some(e) => crate::sources::message_with_address(&url, &format!("couldn't be read ({e}), so the map wasn't moved to it"),),
+            None => crate::sources::message_with_address(&url, "couldn't be read yet, so the map wasn't moved to it"),
         });
     }
     r["inPlace"] = json!(true);
@@ -3989,11 +4003,8 @@ fn add_in_place(
     // Its header couldn't be read (a failure recorded and not tried again yet, or now): the view
     // stays where it was, and the answer says why (the layer says so too, once its read fails).
     if let Err(e) = &info {
-        r["warning"] = json!(format!(
-            "{} couldn't be read ({}), so the map wasn't moved to it",
-            crate::sources::redact(file),
-            crate::sources::redact_text(e)
-        ));
+        r["warning"] =
+            json!(crate::sources::message_with_address(file, &format!("couldn't be read ({e}), so the map wasn't moved to it"),));
     }
     if let Ok(Some(info)) = info {
         let [w, so, e, n] = info.bounds;
@@ -4142,6 +4153,13 @@ pub struct WindowAsked {
     name: Option<String>,
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl WindowAsked {
+    pub(crate) fn bbox(&self) -> [f64; 4] {
+        self.bbox
+    }
+}
+
 /// A window read by [`read_cog_window`], waiting to be added to the project: its raster made and
 /// its GeoTIFF written, so that adding it holds no frame for long.
 #[cfg(not(target_arch = "wasm32"))]
@@ -4158,9 +4176,9 @@ pub struct CogWindow {
 
 /// `p`'s box and cell size, read on the frame, which holds the view.
 #[cfg(not(target_arch = "wasm32"))]
-fn window_settled(s: &Session, p: &Value, url: &str) -> Result<WindowAsked, String> {
+fn window_settled(s: &Session, p: &Value, url: &str, seen: Option<[f64; 4]>) -> Result<WindowAsked, String> {
     let named = |e: String| if e.starts_with(url) { e } else { format!("{url}: {e}") };
-    let bbox = window_box(s, p).map_err(named)?;
+    let bbox = window_box(s, p, seen).map_err(named)?;
     let cell = match p.get("cellSize").filter(|v| !v.is_null()) {
         None => None,
         Some(v) => Some(v.as_f64().filter(|c| c.is_finite() && *c > 0.0).ok_or_else(|| named("cellSize is a size above 0".into()))?),
@@ -4173,18 +4191,25 @@ fn window_settled(s: &Session, p: &Value, url: &str) -> Result<WindowAsked, Stri
 /// to its login, checked as the command checks it. Errors quote the address without its keys.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn window_asked(s: &Session, p: &Value) -> Result<WindowAsked, String> {
+    window_asked_in(s, p, None)
+}
+
+/// [`window_asked`], `"bbox": "view"` being `seen` when given: the box the view was when a request
+/// was queued ([`crate::UrlRequest::view_asked`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn window_asked_in(s: &Session, p: &Value, seen: Option<[f64; 4]>) -> Result<WindowAsked, String> {
     let url = ps(p, "url").map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required")?;
     let checked = web_address(url)
         .and_then(|_| super::raster::as_scan(p))
         .and_then(|scan| window_checks(p, url, scan))
-        .and_then(|()| window_settled(s, p, url));
-    checked.map_err(|e| crate::sources::redact_text(&e))
+        .and_then(|()| window_settled(s, p, url, seen));
+    checked.map_err(|e| crate::sources::message_with_address(url, &e))
 }
 
 /// `layer.addUrl` with `"bbox"`, for those that wait: read here and added.
 #[cfg(not(target_arch = "wasm32"))]
 fn add_cog_window(s: &mut Session, p: &Value, url: &str) -> CmdResult {
-    let read = read_cog_window(&window_settled(s, p, url)?)?;
+    let read = read_cog_window(&window_settled(s, p, url, None)?)?;
     add_window(s, p, read)
 }
 
@@ -4204,7 +4229,7 @@ pub fn read_cog_window(asked: &WindowAsked) -> Result<CogWindow, String> {
     use crate::render::rustgis_tiles::cog;
     use rustgis_data::raster::cog::Level;
     let url = asked.url.as_str();
-    let named = |e: String| crate::sources::redact_text(&if e.starts_with(url) { e } else { format!("{url}: {e}") });
+    let named = |e: String| crate::sources::message_with_address(url, &e);
     let [west, south, east, north] = asked.bbox;
     let cell = asked.cell;
     // The five minutes count from the header's read.
@@ -4517,21 +4542,25 @@ pub(crate) fn box_in_file_longitudes(x0: f64, x1: f64, fx0: f64, fx1: f64) -> Re
 
 /// A window's box: `[west, south, east, north]` in degrees, or `"view"`, the map's extent.
 #[cfg(not(target_arch = "wasm32"))]
-fn window_box(s: &Session, p: &Value) -> Result<[f64; 4], String> {
+fn window_box(s: &Session, p: &Value, seen: Option<[f64; 4]>) -> Result<[f64; 4], String> {
     const NEED: &str = "bbox is [west, south, east, north] in degrees, or \"view\"";
     let [w, so, e, n] = match p.get("bbox") {
-        Some(Value::String(v)) if v.trim().eq_ignore_ascii_case("view") => {
-            let e = super::workspace::view_extent(s);
-            if e.is_empty() {
-                return Err("the map's extent isn't known; give bbox".into());
+        Some(v) if is_view(Some(v)) => match seen {
+            // The view a request was asked in ([`crate::UrlRequest::view_asked`]).
+            Some(b) => b,
+            None => {
+                let e = super::workspace::view_extent(s);
+                if e.is_empty() {
+                    return Err("the map's extent isn't known; give bbox".into());
+                }
+                // A view past 180° (across the antimeridian, or the world more than once) isn't
+                // cut to fit: what it shows past there would be left out.
+                if e.min_x < -180.0 || e.max_x > 180.0 {
+                    return Err("the view reaches past 180° of longitude; give bbox".into());
+                }
+                [e.min_x, e.min_y.max(-90.0), e.max_x, e.max_y.min(90.0)]
             }
-            // A view past 180° (across the antimeridian, or the world more than once) isn't cut
-            // to fit: what it shows past there would be left out.
-            if e.min_x < -180.0 || e.max_x > 180.0 {
-                return Err("the view reaches past 180° of longitude; give bbox".into());
-            }
-            [e.min_x, e.min_y.max(-90.0), e.max_x, e.max_y.min(90.0)]
-        }
+        },
         Some(Value::Array(a)) => {
             let v: Option<Vec<f64>> = a.iter().map(|x| x.as_f64().filter(|x| x.is_finite())).collect();
             match v.as_deref() {
@@ -4543,6 +4572,12 @@ fn window_box(s: &Session, p: &Value) -> Result<[f64; 4], String> {
     };
     let (lon, lat) = (|x: f64| (-180.0..=180.0).contains(&x), |y: f64| (-90.0..=90.0).contains(&y));
     if w < e && so < n && lon(w) && lon(e) && lat(so) && lat(n) { Ok([w, so, e, n]) } else { Err(NEED.into()) }
+}
+
+/// `"bbox": "view"`, in any case or spacing.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_view(bbox: Option<&Value>) -> bool {
+    bbox.and_then(Value::as_str).is_some_and(|v| v.trim().eq_ignore_ascii_case("view"))
 }
 
 /// A GeoTIFF's name from its address: the file name without its extension, or for a dated
@@ -4624,17 +4659,18 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     // A service's features (Add From Service): its answer's axes (against its layer's bounds) and
     // paging.
     let bytes = if service {
-        let label = ps(p, "name").unwrap_or(&url).to_string();
+        let label = ps(p, "name").map(str::to_string).unwrap_or_else(|| crate::sources::address_in_message(&url));
         super::service::features_answer(s, &label, bytes, bounds)
     } else {
         bytes
     };
     // A WCS coverage (Add From Service): a GeoTIFF, or the service's error said as such.
     let name = if coverage {
-        super::service::coverage_check(ps(p, "name").unwrap_or(&url), &bytes)?;
+        let label = ps(p, "name").map(str::to_string).unwrap_or_else(|| crate::sources::address_in_message(&url));
+        super::service::coverage_check(&label, &bytes)?;
         "coverage.tif".to_string()
     } else {
-        url_file_name(&url, &bytes).map_err(|e| format!("{url}: {e}"))?
+        url_file_name(&url, &bytes).map_err(|e| crate::sources::message_with_address(&url, &e))?
     };
     let left_out = parts_left_out(&url, &bytes, p);
     let r = super::raster::add_named_bytes(s, p, name, bytes, b(p, "zoom"))?;

@@ -1,6 +1,6 @@
 //! A plugin's panel: a pane of simple widgets (text, checkboxes, sliders, buttons, trees, forms,
-//! dropdowns, date pickers and range sliders) bound to its commands, declared in `plugin.json`
-//! (`panel`).
+//! dropdowns, date pickers, range sliders and picks on the map) bound to its commands, declared
+//! in `plugin.json` (`panel`).
 //!
 //! A plugin keeps no state between calls (each gets a fresh instance), so the host keeps the
 //! panel's state: the widgets' values and what the plugin last said about them. Every command
@@ -40,7 +40,11 @@ pub const MAX_FORM_CHOICES: usize = 256;
 /// The most options a dropdown (`choice`) holds.
 pub const MAX_CHOICES: usize = 1_000;
 /// The widget kinds.
-pub const KINDS: &[&str] = &["text", "checkbox", "slider", "button", "tree", "form", "choice", "date", "range"];
+pub const KINDS: &[&str] = &["text", "checkbox", "slider", "button", "tree", "form", "choice", "date", "range", "pick"];
+/// What a pick asks for on the map: a point (the default) or a box.
+pub const PICK_SHAPES: &[&str] = &["point", "box"];
+/// The longest coordinate system a pick's value names, in characters (a PROJ definition).
+pub const MAX_PICK_CRS: usize = 2_000;
 
 /// The panel as `plugin.json` declares it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -62,8 +66,8 @@ pub struct PanelDecl {
 }
 
 /// A widget. `kind` is `text`, `checkbox`, `slider`, `button`, `tree`, `form`, `choice` (a
-/// dropdown), `date` (a date picker) or `range` (a slider with two handles); the other fields
-/// apply to some.
+/// dropdown), `date` (a date picker), `range` (a slider with two handles) or `pick` (a place on
+/// the map); the other fields apply to some.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PanelItemDecl {
@@ -71,8 +75,8 @@ pub struct PanelItemDecl {
     /// How the plugin names it in values and states. A button's defaults to its command.
     #[serde(default)]
     pub id: String,
-    /// A caption (text, slider), the box's label (checkbox) or the button's label (its
-    /// command's label when unset).
+    /// A caption (text, slider), the box's label (checkbox) or the button's label (a button's or a
+    /// pick's; its command's label when unset).
     #[serde(default)]
     pub label: String,
     /// Shown on hover.
@@ -82,8 +86,9 @@ pub struct PanelItemDecl {
     #[serde(default)]
     pub text: String,
     /// slider's or a range's when let go (or stepped); a tree's or a dropdown's when a node or an
-    /// option is chosen; a form's when one of its fields changes; a date's when a date is picked.
-    /// Optional for all but buttons, whose values then just go with the plugin's next request.
+    /// option is chosen; a form's when one of its fields changes; a date's when a date is picked;
+    /// a pick's when the place is picked on the map. Optional for all but buttons, whose values
+    /// then just go with the plugin's next request.
     #[serde(default)]
     pub command: String,
     /// A checkbox's first value (a bool), a slider's (a whole number; its `min` if unset), a
@@ -105,6 +110,9 @@ pub struct PanelItemDecl {
     /// A tree with a search box above it, which keeps the nodes whose label holds what's typed.
     #[serde(default)]
     pub search: bool,
+    /// What a pick asks for on the map: `point` (when unset) or `box`.
+    #[serde(default)]
+    pub shape: String,
 }
 
 impl PanelItemDecl {
@@ -113,9 +121,15 @@ impl PanelItemDecl {
         if self.id.is_empty() && self.kind == "button" { &self.command } else { &self.id }
     }
 
-    /// Whether it has a value (a checkbox, a slider, a tree, a form, a dropdown, a date or a range).
+    /// Whether it has a value (a checkbox, a slider, a tree, a form, a dropdown, a date, a range or
+    /// a pick).
     pub fn has_value(&self) -> bool {
-        matches!(self.kind.as_str(), "checkbox" | "slider" | "tree" | "form" | "choice" | "date" | "range")
+        matches!(self.kind.as_str(), "checkbox" | "slider" | "tree" | "form" | "choice" | "date" | "range" | "pick")
+    }
+
+    /// Whether it is a pick that asks for a box (a pick with no shape asks for a point).
+    pub fn picks_box(&self) -> bool {
+        self.kind == "pick" && self.shape == "box"
     }
 
     /// Whether it has ends (a slider or a range).
@@ -245,7 +259,7 @@ impl PanelDecl {
             let kind = item.kind.as_str();
             if !KINDS.contains(&kind) {
                 return Err(format!(
-                    "plugin.json: panel item kind '{}' isn't text, checkbox, slider, button, tree, form, choice, date or range",
+                    "plugin.json: panel item kind '{}' isn't text, checkbox, slider, button, tree, form, choice, date, range or pick",
                     clip(kind, 40)
                 ));
             }
@@ -264,7 +278,14 @@ impl PanelDecl {
                 "text" if !item.command.is_empty() => return Err(what("a text runs no command")),
                 "button" if item.command.is_empty() => return Err(what("a button needs a command")),
                 "checkbox" if item.label.trim().is_empty() => return Err(what("a checkbox needs a label")),
+                "pick" if item.label.trim().is_empty() && item.command.is_empty() => return Err(what("a pick needs a label or a command")),
                 _ => {}
+            }
+            if kind == "pick" && !item.shape.is_empty() && !PICK_SHAPES.contains(&item.shape.as_str()) {
+                return Err(what(&format!("a pick's shape '{}' isn't point or box", clip(&item.shape, 40))));
+            }
+            if kind != "pick" && !item.shape.is_empty() {
+                return Err(what("shape is for picks"));
             }
             if !item.command.is_empty() && !command(&item.command) {
                 return Err(what(&format!("'{}' isn't one of the plugin's commands", clip(&item.command, 80))));
@@ -338,6 +359,49 @@ fn diagnostic_name(s: &str) -> String {
 /// A whole number from an integer or a float with no fraction (JSON from other languages).
 fn whole(v: &Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_f64().filter(|x| x.is_finite() && x.fract() == 0.0 && x.abs() <= SLIDER_LIMIT as f64).map(|x| x as i64))
+}
+
+/// A pick's value from `v`, as it is kept: `null` for none; for a point `{"lon", "lat"}`, for a
+/// box `{"bbox": [west, south, east, north]}` (one whose west longitude is greater than its east
+/// crosses the antimeridian), in degrees, with what the host works out in the map's coordinates
+/// (`x` and `y`, or `extent` `[xmin, ymin, xmax, ymax]`, and `crs`) when they are right. `None`
+/// for anything else. What it leaves out of an object it takes (a field it doesn't know, a wrong
+/// `extent` or `crs`) is reported by [`PanelState::value_report`].
+pub fn pick_value(item: &PanelItemDecl, v: &Value) -> Option<Value> {
+    if v.is_null() {
+        return Some(Value::Null);
+    }
+    let o = v.as_object()?;
+    let num = |v: Option<&Value>| v.and_then(Value::as_f64).filter(|x| x.is_finite());
+    let four = |k: &str| -> Option<[f64; 4]> {
+        let a = o.get(k)?.as_array().filter(|a| a.len() == 4)?;
+        Some([num(a.first())?, num(a.get(1))?, num(a.get(2))?, num(a.get(3))?])
+    };
+    let lon = |x: f64| (-180.0..=180.0).contains(&x);
+    let lat = |y: f64| (-90.0..=90.0).contains(&y);
+    let mut out = Map::new();
+    if item.picks_box() {
+        let b = four("bbox")?;
+        if !(lon(b[0]) && lon(b[2]) && lat(b[1]) && lat(b[3]) && b[1] <= b[3]) {
+            return None;
+        }
+        out.insert("bbox".into(), json!(b));
+        if let Some(e) = four("extent").filter(|e| e[0] <= e[2] && e[1] <= e[3]) {
+            out.insert("extent".into(), json!(e));
+        }
+    } else {
+        let (x, y) = (num(o.get("lon")).filter(|x| lon(*x))?, num(o.get("lat")).filter(|y| lat(*y))?);
+        out.insert("lon".into(), json!(x));
+        out.insert("lat".into(), json!(y));
+        if let (Some(x), Some(y)) = (num(o.get("x")), num(o.get("y"))) {
+            out.insert("x".into(), json!(x));
+            out.insert("y".into(), json!(y));
+        }
+    }
+    if let Some(crs) = o.get("crs").and_then(Value::as_str).filter(|c| !c.trim().is_empty() && c.chars().count() <= MAX_PICK_CRS) {
+        out.insert("crs".into(), json!(crs));
+    }
+    Some(Value::Object(out))
 }
 
 /// A nonnegative whole count, retaining exact u64 integers and accepting integral floats.
@@ -481,7 +545,11 @@ impl Dropped {
         for (ids, unlisted, what) in [
             (&self.fields, self.unlisted_fields, "item field(s) not taken (unknown, inapplicable, wrong type or invalid bounds)"),
             (&self.clipped, self.unlisted_clipped, "item field(s) clipped or truncated"),
-            (&self.adjusted, 0, "value(s) adjusted (clamped or reordered, or choice cleared)"),
+            (
+                &self.adjusted,
+                0,
+                "value(s) adjusted (clamped or reordered, choice cleared, or a place's unknown or invalid fields left out)",
+            ),
         ] {
             if !ids.is_empty() {
                 let names = ids.iter().take(MAX_NAMED).map(|s| diagnostic_name(s)).collect::<Vec<_>>().join(", ");
@@ -787,6 +855,9 @@ impl PanelState {
                 "form" => {
                     values.insert(id.clone(), Value::Object(Map::new()));
                 }
+                "pick" => {
+                    values.insert(id.clone(), Value::Null);
+                }
                 _ => {}
             }
             items.insert(
@@ -837,6 +908,11 @@ impl PanelState {
         self.values.get(id).and_then(pair).unwrap_or((0, 0))
     }
 
+    /// A pick's place, if one was picked ([`pick_value`]).
+    pub fn picked(&self, id: &str) -> Option<&Map<String, Value>> {
+        self.values.get(id).and_then(Value::as_object)
+    }
+
     /// A slider's label for value `v`: its own label there, or the number.
     pub fn slider_label(&self, id: &str, v: i64) -> String {
         let Some(st) = self.items.get(id) else { return v.to_string() };
@@ -852,7 +928,8 @@ impl PanelState {
     /// whole number (kept within its ends), a range `[low, high]` (kept within its ends, low
     /// first), a tree one of its nodes' ids and a dropdown one of its options' ids (`null` for
     /// none), a date `YYYY-MM-DD` (`null` for none), a form an object of field values (merged
-    /// into the ones it had). Anything else is ignored. Returns the ids set.
+    /// into the ones it had), a pick a place ([`pick_value`]) or `null`. Anything else is ignored.
+    /// Returns the ids set.
     pub fn set_values(&mut self, decl: &PanelDecl, values: &Value) -> Vec<String> {
         let Some(given) = values.as_object() else { return Vec::new() };
         let mut set = Vec::new();
@@ -888,6 +965,7 @@ impl PanelState {
                     Value::String(d) if date(d).is_some() => Some(v.clone()),
                     _ => None,
                 },
+                "pick" => pick_value(d, v),
                 "range" => pair(v).map(|(a, b)| {
                     let (min, max) = self.items.get(id).map_or((d.min, d.max), |s| (s.min, s.max));
                     let (a, b) = (a.clamp(min, max.max(min)), b.clamp(min, max.max(min)));
@@ -939,6 +1017,12 @@ impl PanelState {
             let changed = match item.kind.as_str() {
                 "slider" => whole(input) != whole(kept),
                 "range" => pair(input) != pair(kept),
+                // A place kept without some of what was given with it (a field it doesn't know,
+                // a wrong extent or coordinate system).
+                "pick" => match (input.as_object(), kept.as_object()) {
+                    (Some(given), Some(kept)) => given.keys().any(|k| !kept.contains_key(k)),
+                    _ => false,
+                },
                 _ => false,
             };
             if changed {
@@ -954,7 +1038,8 @@ impl PanelState {
     /// and for a form `fields`. Unknown ids and fields, and values of the wrong type, are ignored;
     /// texts are clipped, sliders' values kept within their ends, a tree's chosen node among its
     /// nodes, and a form's value to its fields (a field the plugin no longer gives is dropped; a
-    /// new one starts at its default). Returns the values, options and nodes left out.
+    /// new one starts at its default). A pick's value can only be cleared (`null`): the place is
+    /// the user's to pick. Returns the values, options and nodes left out.
     pub fn apply(&mut self, decl: &PanelDecl, update: &Value) -> Dropped {
         let mut dropped = Dropped::default();
         if !update.is_object() {
@@ -1106,12 +1191,30 @@ impl PanelState {
             }
         }
         if let Some(values) = update.get("values") {
-            let set = self.set_values(decl, values);
-            let report = self.value_report(decl, values, &set);
+            // A plugin can clear a pick, not pick a place itself: the others are refused, but for
+            // the place held given back (a plugin answering its whole panel), compared as it would
+            // be kept, so its numbers written otherwise (`10` for `10.0`) are the same place.
+            let mut values = values.clone();
+            let mut placed = Vec::new();
+            if let Some(o) = values.as_object_mut() {
+                o.retain(|id, v| {
+                    let refused = !v.is_null()
+                        && decl.item(id).filter(|d| d.kind == "pick").is_some_and(|d| pick_value(d, v).as_ref() != self.values.get(id));
+                    if refused {
+                        placed.push(id.clone());
+                    }
+                    !refused
+                });
+            }
+            let set = self.set_values(decl, &values);
+            let report = self.value_report(decl, &values, &set);
             dropped.values = report.values;
             dropped.unlisted_values = report.unlisted_values;
             dropped.adjusted = report.adjusted;
             dropped.malformed += report.malformed;
+            for id in &placed {
+                dropped.rejected_value(id);
+            }
         }
         // New ends keep the values within them, and new nodes or options the chosen one among them.
         for d in &decl.items {
@@ -1179,6 +1282,7 @@ mod tests {
                 max: 0,
                 steps: false,
                 search: false,
+                shape: String::new(),
             }],
         }
     }
