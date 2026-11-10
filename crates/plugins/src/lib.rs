@@ -45,6 +45,9 @@ pub use package::Package;
 pub use panel::{Dropped, FormField, PanelDecl, PanelItemDecl, PanelState, TreeNode};
 pub use runtime::{Host, NoHost};
 
+/// The error a command or tool stopped at its time limit ends with.
+pub const RAN_TOO_LONG: &str = "it ran too long and was stopped";
+
 /// Plugin command and tool ids start with this: `plugin:<plugin>/<command>`.
 pub const PREFIX: &str = "plugin:";
 
@@ -447,7 +450,7 @@ fn call_wasm_limited(module: &wasmi::Module, host: &mut dyn Host, request: &Valu
     let mut timed = Timed { host, deadline };
     let out = runtime::call(module, &mut timed, request, runtime::COMMAND_FUEL)?;
     if std::time::Instant::now() >= deadline {
-        return Err("it ran too long and was stopped".into());
+        return Err(RAN_TOO_LONG.into());
     }
     Ok(out)
 }
@@ -469,7 +472,7 @@ struct Timed<'a> {
 impl Host for Timed<'_> {
     fn call(&mut self, op: &str, params: &Value) -> Result<Value, String> {
         if std::time::Instant::now() >= self.deadline {
-            return Err("it ran too long and was stopped".into());
+            return Err(RAN_TOO_LONG.into());
         }
         self.host.call(op, params)
     }

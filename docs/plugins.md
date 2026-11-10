@@ -186,8 +186,11 @@ cargo build --release --target wasm32-unknown-unknown
   not a JSON object or a form definition; it defaults to `"{}"`.
 - `commands[].icon`: the name of one of RustGIS's own icons (`stats`, `zoom_full`, `bookmark`,
   `buffer`…), or a puzzle piece when it isn't one.
-- `commands[].timeout`: seconds the command may run, from 1 to 86400; unset is 120. Set it for
-  a command that does long work, such as downloading a dataset.
+- `commands[].timeout`: seconds the command may run, from 1 to 86400; unset is 120. It holds on
+  the command line, in Python and in scripts. The desktop app runs commands on its window's own
+  thread, which can't draw or cancel until a command answers, so there a command still stops
+  after 120 seconds and its error says so. Long work such as downloading a dataset belongs in a
+  tool, which the desktop app runs in the background with progress and Cancel.
 - Tool parameter `kind`s: `layer`, `vectorLayer`, `polygonLayer`, `pointLayer`, `field`,
   `numericField`, `number`, `text`, `choice` (with 1 to 64 `choices`), `bool` and `file` (see
   [File parameters](#file-parameters)). Each has `name`, `label`, optional `help`, `required`
@@ -714,7 +717,7 @@ requests and replies over its standard input and output, one JSON object per lin
 
 Output lines that aren't protocol messages are logged and skipped, since libraries print (even
 JSON), and so is the program's error output. A command is stopped after 2 minutes unless its
-`timeout` says otherwise; a tool runs until it finishes or is cancelled (the desktop app runs
+`timeout` says otherwise (in the desktop app, 2 minutes at most); a tool runs until it finishes or is cancelled (the desktop app runs
 it in the background: see [What a plugin can ask for](#what-a-plugin-can-ask-for)).
 
 The plugin above, in Python with no SDK:
