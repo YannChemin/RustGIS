@@ -313,8 +313,11 @@ fn form(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, stat
                             .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
                             .unwrap_or_default();
                         let shown = if now.is_empty() { "—".to_string() } else { now.join(", ") };
-                        let r =
-                            egui::ComboBox::from_id_salt(("plugin-form-multi", pid, id, &f.id)).selected_text(shown).show_ui(ui, |ui| {
+                        // Stays open across ticks so several choices can be picked in one go.
+                        let r = egui::ComboBox::from_id_salt(("plugin-form-multi", pid, id, &f.id))
+                            .selected_text(shown)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show_ui(ui, |ui| {
                                 for c in &f.choices {
                                     let mut on = now.iter().any(|x| x == c);
                                     if ui.checkbox(&mut on, c).changed() {

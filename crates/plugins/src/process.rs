@@ -464,6 +464,10 @@ fn converse(stdin: &Writer, rx: &Receiver<Line>, host: &mut dyn Host, request: &
             }
             let op = c.get("op").and_then(Value::as_str).unwrap_or_default();
             let params = c.get("params").cloned().unwrap_or(Value::Null);
+            // Copying a large request takes time: a request is not started past the deadline.
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err("it ran too long and was stopped".into());
+            }
             let reply = match host.call(op, &params) {
                 Ok(v) => json!({"ok": v}),
                 Err(e) => json!({"error": e}),
