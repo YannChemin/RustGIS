@@ -305,8 +305,7 @@ impl PanelDecl {
                 return Err(what("options are for dropdowns (choice)"));
             }
             let mut option_changes = Dropped::default();
-            let options =
-                if picks_an_option(kind) { choice_options_reported(&item.options, &mut option_changes) } else { Vec::new() };
+            let options = if picks_an_option(kind) { choice_options_reported(&item.options, &mut option_changes) } else { Vec::new() };
             if let Some(notice) = option_changes.notice() {
                 return Err(what(&format!("option labels or fields are invalid: {notice}")));
             }
