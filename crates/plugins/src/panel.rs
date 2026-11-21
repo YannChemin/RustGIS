@@ -302,7 +302,7 @@ impl PanelDecl {
                 return Err(what("min, max and steps are for sliders and ranges"));
             }
             if !picks_an_option(kind) && !item.options.is_empty() {
-                return Err(what("options are for dropdowns (choice)"));
+                return Err(what("options are for dropdowns and tab rows (choice, tabs)"));
             }
             let mut option_changes = Dropped::default();
             let options = if picks_an_option(kind) { choice_options_reported(&item.options, &mut option_changes) } else { Vec::new() };
@@ -333,7 +333,7 @@ impl PanelDecl {
                 }
                 ("date", Some(Value::String(d))) if date(d).is_some() => {}
                 ("date", Some(_)) => return Err(what("a date's default is a date written YYYY-MM-DD")),
-                _ => return Err(what("only checkboxes, sliders, ranges, dropdowns and dates have a default")),
+                _ => return Err(what("only checkboxes, sliders, ranges, dropdowns, tab rows and dates have a default")),
             }
             if item.ranged() && (item.min > item.max || item.min < -SLIDER_LIMIT || item.max > SLIDER_LIMIT) {
                 return Err(what(&format!("a slider's or a range's min must not be above its max, both within ±{SLIDER_LIMIT}")));

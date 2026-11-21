@@ -2341,9 +2341,7 @@ fn panel_tabs_hold_their_options_and_value_like_a_dropdown() {
 #[test]
 fn panel_tabs_take_only_an_option_id_as_their_default() {
     let mut m: Value = serde_json::from_str(&testing::panel_manifest("tabs-bad")).unwrap();
-    m["panel"]["items"].as_array_mut().unwrap().push(
-        json!({"kind": "tabs", "id": "step", "options": [{"id": "a"}], "default": "b"}),
-    );
+    m["panel"]["items"].as_array_mut().unwrap().push(json!({"kind": "tabs", "id": "step", "options": [{"id": "a"}], "default": "b"}));
     let e = Manifest::parse(&m.to_string()).unwrap_err();
     assert!(e.contains("one of its options"), "{e}");
 }
