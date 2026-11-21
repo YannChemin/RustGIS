@@ -211,7 +211,10 @@ impl Session {
     }
     /// Lands only the original read invocation; no result can be claimed by another command.
     pub(crate) fn finish_read(&mut self, read: crate::cmd::reads::Read) -> CmdResult {
-        let crate::cmd::reads::Read { op, owner, source, ready, inputs } = read;
+        let crate::cmd::reads::Read { op, owner, source, ready, inputs, room, reservation } = read;
+        // History set aside for the edit's copy goes back if the edit fails or never copied, while
+        // nothing else has changed the history since (#2431).
+        let in_place = room.as_ref().is_some_and(|room| room.stamp == self.history_stamp());
         let (command, params) = match op.op() {
             CommandOp::Registered { spec, params } => (spec.id, params.clone()),
             _ => return Err("not a registered read command".into()),
@@ -233,7 +236,11 @@ impl Session {
                         }
                         s.check_read_command(&op)?;
                         s.read_ahead = ready;
-                        let result = s.invoke(op, Txn::Own);
+                        // An edit without a worker copies here, when it lands.
+                        let result = match room.as_ref().filter(|room| room.count > 0) {
+                            Some(room) => rustgis_data::before_rows_copy(room.free_on_copy(), || s.invoke(op, Txn::Own)).0,
+                            None => s.invoke(op, Txn::Own),
+                        };
                         if result.is_ok()
                             && let Some(source) = crate::sources::added_by(command, &params)
                         {
@@ -245,6 +252,12 @@ impl Session {
             })
         }));
         self.read_ahead = None;
+        if let Some(room) = &room {
+            let failed = !matches!(&result, Ok(Ok(_)));
+            self.put_back(room, failed, in_place);
+            self.forget_room(room);
+        }
+        drop(reservation);
         match result {
             Ok(result) => result,
             Err(panic) => std::panic::resume_unwind(panic),
@@ -832,7 +845,7 @@ impl Session {
         op: Authorized<ToolOp>,
         control: &Arc<rustgis_analysis::control::Control>,
         opts: &crate::cmd::gp::RunOpts,
-    ) -> Result<(Value, Vec<String>), String> {
+    ) -> Result<(Value, crate::cmd::gp::ToolMessages), String> {
         let node = op.node.clone();
         let number = node.number;
         let result = self.with_node(node, |s| crate::cmd::gp::execute(s, op, control, opts));
@@ -1017,7 +1030,7 @@ impl Session {
             opened: self.opened,
             map: self.map().instance_id(),
             epoch: self.policy.epoch.clone(),
-            accounts: if reads { self.policy_accounts() } else { Value::Null },
+            accounts: if reads { self.continuation_accounts(&node) } else { Value::Null },
             sources,
             time_sources: node_time_sources(&node),
             tables,
@@ -1084,6 +1097,17 @@ impl Session {
         let node = self.policy.nodes.last().cloned().ok_or("late work needs an authorized initiating operation")?;
         self.continuation_for(node)
     }
+    /// Retains the admitted token-generation authority without its password. Canonicalizing the
+    /// already-resolved connection selector keeps name-based calls bound to the same login identity.
+    pub(crate) fn token_continuation(&self, id: &str) -> Result<Continuation, String> {
+        let node = self.policy.nodes.last().ok_or("late work needs an authorized initiating operation")?;
+        let mut clean = (**node).clone();
+        if let Some(params) = clean.params.as_object_mut() {
+            params.remove("password");
+            params.insert("id".into(), json!(id));
+        }
+        self.continuation_for(Arc::new(clean))
+    }
     /// Checks generation, map, revocation, current load and private source/account identity.
     pub(crate) fn check_continuation(&self, c: &Continuation) -> Result<(), String> {
         self.check_continuation_origin(c)?;
@@ -1117,7 +1141,7 @@ impl Session {
         if c.opened != self.opened {
             return Err("this run belongs to a replaced project".into());
         }
-        if !c.accounts.is_null() && c.accounts != self.policy_accounts() {
+        if !c.accounts.is_null() && c.accounts != self.continuation_accounts(&c.node) {
             return Err("the live source or account changed since this request started".into());
         }
         Ok(())
@@ -1199,6 +1223,15 @@ impl Session {
     /// Refuses foreign ingress before a failed start may retire its owner's queued work.
     pub(crate) fn check_delivery_owner(&self, c: &Continuation) -> Result<(), String> {
         if !self.policy.scopes.is_empty() && !self.scope().same_caller(&c.scope) {
+            return Err("this run belongs to another caller".into());
+        }
+        Ok(())
+    }
+    /// Exactly the caller that started the late work, root and scoped alike: another caller (even
+    /// the trusted native root, which `check_delivery_owner` lets deliver) is refused before it
+    /// can read, consume or cancel the owner's result.
+    pub(crate) fn same_owner(&self, c: &Continuation) -> Result<(), String> {
+        if !self.scope().same_caller(&c.scope) {
             return Err("this run belongs to another caller".into());
         }
         Ok(())

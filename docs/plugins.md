@@ -203,11 +203,16 @@ cargo build --release --target wasm32-unknown-unknown
 - `commands[].form` (optional) gives the command a dialog of its own: its ribbon button (tab
   entry, panel button, Command Search entry, shortcut) opens a window with these fields instead of
   running it, and **Run** runs the command with their values as its parameters, by their `name`s.
-  Fields are declared like tool parameters (below), with `rasterLayer` added and `file` left out
-  (a command that reads a file asks for it with host calls, behind the `files` permission); a
-  `field` or `numericField` lists the fields of the nearest layer field above it, which must be a
-  vector one (`vectorLayer`, `polygonLayer` or `pointLayer`), and required when the field is. A
-  required layer starts at the active layer when it is of the kind, an optional one offers `—` to
+  Fields are declared like tool parameters (below), with `rasterLayer` and `table` added and
+  `file` left out (a command that reads a file asks for it with host calls, behind the `files`
+  permission). A `table` offers the standalone tables (a CSV or a spreadsheet without
+  coordinates comes in as one, not as a layer) after the layers a `vectorLayer` offers, and sends
+  the name picked; a table named like a layer, which the name would find instead, isn't offered.
+  `host.features` reads layers only. RustGIS versions before `table` refuse a plugin with one, so
+  set `minRustgisVersion` to the first version with it. A `field` or `numericField` lists the
+  fields of the nearest layer or table field above it, which must be a `vectorLayer`,
+  `polygonLayer`, `pointLayer` or `table`, and required when the field is. A required layer
+  starts at the active layer when it is of the kind, an optional one offers `—` to
   leave it out (a `choice` with a `default` counts as required and offers no `—`), and **Run**
   waits until the required fields are filled in. An optional number left empty, or an optional
   checkbox without a `default` never ticked, is left out of the parameters; a required checkbox is
@@ -222,11 +227,39 @@ cargo build --release --target wasm32-unknown-unknown
   dialogs ignore `form` and run the command when its button is clicked, without these parameters:
   set `minRustgisVersion` to the first version with them, or have the command answer what it needs
   then.
+- `"tabs": true` on a `choice` field of `commands[].form` draws it as a row of tabs at the top of
+  the dialog instead of a drop-down, for a dialog that shows a few parts of something, such as an
+  About window's authors, data sources and how to contribute. The field's label isn't shown (its
+  `help` is each tab's hover text), and one tab is always selected: the one kept from the last
+  opening, else the `default`, else the first choice. Clicking a tab, the selected one too, runs
+  the command with the dialog's values and shows its answer, so such a dialog has no **Run**;
+  while required fields are empty, a click only selects the tab and the dialog says what to fill
+  in, and a tab clicked while a run is going runs once that run has answered. On opening, a
+  dialog with tabs runs once when its required fields have values (a dialog without tabs runs
+  only from **Run**), so give tabs only to a command that shows something, not one that changes
+  the project or writes files. A form has at most one field with tabs, and only a `choice` may
+  have them; tool parameters can't, or the plugin is refused.
+  RustGIS versions before tabs ignore the key and show the drop-down and **Run**.
+
+  ```json
+  {"id": "about", "label": "About", "form": [
+    {"name": "part", "label": "Part", "kind": "choice", "tabs": true,
+     "choices": ["Authors", "Data sources", "How to contribute"]}
+  ]}
+  ```
 - `commands[].timeout`: seconds the command may run, from 1 to 86400; unset is 120. It holds on
   the command line, in Python and in scripts. The desktop app runs commands on its window's own
   thread, which can't draw or cancel until a command answers, so there a command still stops
   after 120 seconds and its error says so. Long work such as downloading a dataset belongs in a
   tool, which the desktop app runs in the background with progress and Cancel.
+- `commands[].login`: the sign-in the command's data needs, one RustGIS keeps for the user:
+  `earthdata` (an Earthdata Login token), `copernicus` (a Copernicus Data Space sign-in) or
+  `arcgis` (an ArcGIS session). On the plugin's tab, the command's button and menu row show a key
+  over their icon: green while that sign-in is kept (an Earthdata token or an ArcGIS session that
+  hasn't expired or renews itself, a sign-in remembered on this computer included), red and
+  struck through while it is missing; the tooltip says which sign-in and where to give it. The
+  command still runs either way, so it should still say what's missing. Any other value refuses
+  the plugin; RustGIS versions before it ignore the field.
 - Tool parameter `kind`s: `layer`, `vectorLayer`, `polygonLayer`, `pointLayer`, `field`,
   `numericField`, `number`, `text`, `choice` (with 1 to 64 `choices`), `bool` and `file` (see
   [File parameters](#file-parameters)). Each has `name`, `label`, optional `help`, `required`
@@ -699,10 +732,12 @@ that needs it left out.
   or cloud metadata addresses, and no redirect may lead there or from `https` to `http`. Names
   are checked as written and again where they resolve, on every redirect too, so a name that
   resolves to this computer or the local network is refused on the desktop and the command line
-  (in the web app, the browser decides what it may reach). Requests carry no credentials (an
-  S3 connection's included) and no headers of the plugin's. On the desktop and the command line
-  they never go through a proxy (`HTTPS_PROXY` and the like are ignored), since a proxy would
-  reach addresses RustGIS can't check.
+  (in the web app, the browser decides what it may reach). Requests carry no credentials, on
+  every redirect too: no S3 connection's signature, no service login, and no Earthdata, Copernicus
+  Data Space or ArcGIS sign-in's token. In the web app they send no cookies. They carry no headers
+  of the plugin's. On the desktop and the command line they never go through a proxy
+  (`HTTPS_PROXY` and the like are ignored), since a proxy would reach addresses RustGIS can't
+  check.
 - At most 2 MB, in UTF-8 (a byte-order mark is dropped). An answer that isn't a success (404,
   500…) is an error ending in `HTTP <status>`.
 - Answers are kept for 10 minutes (up to 256 documents and 16 MB in all) while RustGIS runs,

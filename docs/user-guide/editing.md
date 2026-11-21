@@ -25,6 +25,13 @@ feature edits; use ++cmd++ instead of ++ctrl++ on macOS. While typing in a text 
 shortcuts undo or redo the typing instead. Saving keeps the undo history; opening or creating
 a project clears it. Undo does not reverse files already written by an export.
 
+In the desktop and browser toolbar, open **Undo History** next to Undo and Redo to see the
+current project state and the available steps. Select a row to go directly to the state after
+that change, or **Earliest available state** to undo every retained step. You can select a newer
+row to redo those changes. On a narrow window, Undo History may be under **More Quick Access
+commands**. For longer jumps, **Cancel** in the status bar stops at the state reached so far.
+Making a new edit after going back discards the redo steps.
+
 ## Which parcel area to report
 
 **Calculate Geometry** and `area('ac')` measure the polygon on the WGS 84 ellipsoid, regardless
@@ -348,7 +355,12 @@ moving layers between maps.
 Pop-ups (Home › Navigate) choose which layers a click with Explore identifies: the topmost layer
 under the click, every visible layer, only selectable layers, only the layer selected in Layers, or
 nothing. The pop-up lists every feature under the click in those layers, overlapping ones included
-(up to 100): step through them with ‹ ›. The feature shown is the one selected. The magnifier in
+(up to 100): step through them with ‹ ›. The feature shown is the one selected; when the pop-up
+shows a raster's pixel or a web tile layer's feature, nothing is selected. The topmost and
+visible modes take a raster's pixel values too, placed among the features by the drawing order: a
+raster drawn over a polygon (rain clipped to an area whose outline stays on the map, say) shows its
+pixel, and a polygon drawn over a raster shows its feature. The other two modes show the topmost
+raster's pixel only when no feature is under the click. The magnifier in
 the pop-up's header zooms to it. Long feature titles and layer names are shortened with an
 ellipsis to leave room for the header controls; hover over either name to read it in full.
 

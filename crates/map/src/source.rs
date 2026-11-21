@@ -49,8 +49,27 @@ pub struct AmbiguousAreas {
 impl AmbiguousAreas {
     /// Count each affected feature once and all of its ambiguous rings.
     pub fn from_features(features: &[rustgis_data::Feature]) -> Self {
+        Self::from_geometries(features.iter().filter_map(|feature| feature.geometry.as_ref()))
+    }
+
+    /// [`AmbiguousAreas::from_features`] of features given in `crs`, read in longitude/latitude
+    /// (a place that can't be given there is left out of its ring).
+    pub fn from_features_in(features: &[rustgis_data::Feature], crs: rustgis_data::raster::Crs) -> Self {
+        if crs == rustgis_data::raster::Crs::LonLat {
+            return Self::from_features(features);
+        }
+        let Ok(to) = crs.to(rustgis_data::raster::Crs::LonLat) else { return Self::default() };
+        // One converted geometry at a time, not a copy of the layer.
         let mut counts = Self::default();
-        for geometry in features.iter().filter_map(|feature| feature.geometry.as_ref()) {
+        for g in features.iter().filter_map(|f| f.geometry.as_ref()) {
+            counts.include(Self::from_geometries(std::iter::once(&to.geometry(g))));
+        }
+        counts
+    }
+
+    fn from_geometries<'a>(geometries: impl Iterator<Item = &'a rustgis_data::Geometry>) -> Self {
+        let mut counts = Self::default();
+        for geometry in geometries {
             let rings = geometry.ambiguous_area_rings();
             if rings > 0 {
                 counts.rings = counts.rings.saturating_add(rings);
@@ -136,6 +155,10 @@ pub struct SourceLayer {
     /// explicit source reset discards them. Display-only resets preserve them in `sync_sources`.
     #[serde(skip)]
     pub(crate) saved_selection: Vec<u64>,
+    /// The datum grids this window was read with ([`rustgis_data::raster::crs::grid_generation`]):
+    /// a window read before a grid arrived is read again, as after a change of projection.
+    #[serde(skip)]
+    pub(crate) grids: Option<u64>,
     #[serde(skip)]
     pub(crate) window_fields: Option<usize>,
     /// The layer's definition query, applied while a view is read rather than to the rows read.
@@ -958,9 +981,20 @@ impl SourceLayer {
         Ok(new)
     }
 
+    /// The system its features are given in ([`FeatureSource::coord_crs`]): the file's own for a
+    /// file read in place; longitude/latitude until it is open.
+    pub fn coord_crs(&self) -> rustgis_data::raster::Crs {
+        self.handle.as_ref().map_or(rustgis_data::raster::Crs::LonLat, |h| h.coord_crs())
+    }
+
     /// A source that can be read whole a chunk at a time, for an export.
     pub fn visit_source(&self) -> Option<Arc<dyn FeatureSource>> {
         self.handle.as_ref().filter(|h| h.visits_chunks()).cloned()
+    }
+
+    /// A source that can provide all features in an extent a chunk at a time.
+    pub(super) fn visit_extent_source(&self) -> Option<Arc<dyn FeatureSource>> {
+        self.handle.as_ref().filter(|h| h.visits_extent_chunks()).cloned()
     }
 
     /// A source capable of a complete, ordered render traversal.
@@ -1420,7 +1454,7 @@ impl SourceLayer {
             n => n,
         };
         let count = h.info().count;
-        let query = Query { text: query.to_string(), fields: fields.to_vec() };
+        let query = Query { text: query.to_string(), fields: fields.to_vec(), env: Default::default() };
         let crowded = count.is_none_or(|c| c > most as u64) || self.sampled().is_some();
         (window::walked(h.as_ref(), &query).is_none() && crowded).then_some((count, most))
     }
@@ -1546,10 +1580,15 @@ impl SourceLayer {
 
     /// Applies the layer's definition query (`fields` are the layer's) as views are read; a
     /// different one reads the view again.
-    pub(crate) fn set_query(&mut self, text: Option<&str>, fields: &[rustgis_data::Field]) {
+    pub(crate) fn set_query(&mut self, text: Option<&str>, fields: &[rustgis_data::Field], env: &rustgis_data::query::Env) {
         let text = text.map(str::trim).filter(|t| !t.is_empty());
-        if self.query.as_ref().map(|q| (q.text.as_str(), q.fields.as_slice())) != text.map(|t| (t, fields)) {
-            self.query = text.map(|t| Query { text: t.to_string(), fields: fields.to_vec() });
+        let page = env.page.as_ref().filter(|_| text.is_some_and(rustgis_data::query::reads_series_page));
+        if self.query.as_ref().map(|q| (q.text.as_str(), q.fields.as_slice(), q.env.page.as_ref())) != text.map(|t| (t, fields, page)) {
+            self.query = text.map(|t| Query {
+                text: t.to_string(),
+                fields: fields.to_vec(),
+                env: rustgis_data::query::Env { page: page.cloned(), ..Default::default() },
+            });
             // A source that can't be walked reads the same rows whatever the query.
             if self.handle.as_ref().is_some_and(|h| h.visits_chunks()) {
                 self.reread();
@@ -1800,6 +1839,7 @@ impl SourceLayer {
             estimated_row_bytes: _,
             full_read: _,
             saved_selection: _,
+            grids: _,
             window_fields: _,
             query: _,
             opening: _,
